@@ -1,0 +1,22 @@
+{
+    "name": "AmazonBot",
+    "version": "0.1",
+    "manifest_version": 2,
+    "description": "An extension to copy all of simons nude images.",
+      
+    "content_scripts": [ {
+        "js": [ "jquery-1.8.0.min.js", "content_script.js"  ],
+        "matches": [ "https://www.amazon.de/*" ]    
+    } ],
+
+    "permissions" : [
+        "tabs",
+        "https://www.amazon.de/*"
+        
+            ]
+}
+
+
+
+
+
