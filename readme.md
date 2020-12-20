@@ -1,5 +1,11 @@
 # 🚀🚀🚀 Amazon Bot 🚀🚀🚀
 
+# What does the bot do: 
+This bot is active on all amazontabs as soon as enabled. It only makes sense on specific sites like https://www.amazon.de/MSI-RTX-3070-Gaming-Trio/dp/B08LNPPCWJ. 
+On a site like this one, it will look for the "add to cart" or the "buy now" button. If those buttons are not present, it will refresh the page. 
+If they are present, the bot will try to find a price from its configuration. If a price is found and if the price is <= the price of this offer, it will press the "buy now"- button (Note: At this point, no purchase is made yet, you are one click away from making a purchase) and use an alert. 
+Better notifications will be implemented in the future, an option to fully finish the buyprocess aswell. 
+
 # How to use: 
 
 1. clone this repository and extract it
