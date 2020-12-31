@@ -5,44 +5,104 @@ let timeoutTime = 5000;
 let priceObject = {
   "3070": 650,
   "3080": 850,
+  "Ryzen 7 5800X": 480, 
+  "Ryzen 9 5900X": 600
 };
 
-console.log("Extension loaded successfully!");
+//recursiveBuyButtonLookup();
+checkPage(); 
 
-recursiveBuyButtonLookup();
+function checkPage(){
+  //Redirect Page after 'add to cart'
+  if(document.URL.indexOf('https://www.amazon.de/gp/huc')>=0 || document.URL.indexOf('https://www.amazon.de/gp/yourstore')>=0){
+    window.open('https://www.amazon.de/gp/buy/spc/handlers/display.html?hasWorkingJavascript=1','_self');
+  }else if(document.URL == 'https://www.amazon.de/gp/buy/spc/handlers/display.html?hasWorkingJavascript=1'){
+    validateCartAndBuy(); 
+  }else {
+    recursiveBuyButtonLookup(); 
+  }
+}
+
+function validateCartAndBuy(){
+  let nameFromLocalStorage = localStorage.getItem('itemName'); 
+
+  //See if it is contained in HTML
+  let entireHTMLAsString = document.getElementsByTagName('html')[0].innerText; 
+
+  if(entireHTMLAsString.indexOf(nameFromLocalStorage)>=0){
+    let maxPrice = Number(localStorage.getItem('itemPrice')); 
+
+    let totalCheckoutPrice = document.getElementsByClassName('a-color-price a-size-medium a-text-right grand-total-price aok-nowrap a-text-bold a-nowrap')[0].innerText; 
+    totalCheckoutPrice = cleanUpItemPrice(totalCheckoutPrice); 
+    if(totalCheckoutPrice <= maxPrice){
+      let buyNowButton = document.getElementsByName('placeYourOrder1')[0];
+      buyNowButton.click(); 
+    }else{
+      localStorage.setItem('itemName', null); 
+      localStorage.setItem('itemPrice', null); 
+      window.alert('price must have changed in cart...');
+    }
+
+  }else{
+    localStorage.setItem('itemName', null); 
+    localStorage.setItem('itemPrice', null);
+    window.alert('Something went wrong, names did not match'); 
+  }
+
+}
 
 function recursiveBuyButtonLookup() {
-  let toCartButton = document.getElementById("add-to-cart-button");
-  let buyButton = document.getElementById("buy-now-button");
-
-  if (buyButton != null) {
+  requestNotificationPermissionIfDefault(); 
+  let addToCartButton = document.getElementById("add-to-cart-button");
+  
+  if (addToCartButton != null) {
     console.log("Able to buy!!");
     let itemTitle = document.getElementById("productTitle").innerText;
     let itemPrice = document.getElementById("priceblock_ourprice").innerText;
-    itemPrice = itemPrice.replace(",", ".");
-    itemPrice = itemPrice.replace("€", "");
-    itemPrice = itemPrice.replace("$", "");
+    itemPrice = cleanUpItemPrice(itemPrice); 
 
     for (let key in priceObject) {
       if (itemTitle.indexOf(key) >= 0) {
         if (itemPrice <= priceObject[key]) {
-          buyButton.click();
-          alert("Attempting to buy...");
+          sendNotification(`Attempting to buy ${itemTitle} at ${itemPrice} / ${priceObject[key]}`);
+          localStorage.setItem('itemName', itemTitle); 
+          localStorage.setItem('itemPrice', priceObject[key]); 
+          addToCartButton.click();
           break;
         } else {
-          console.log(
-            "Item is too expensive at " +
-              itemPrice +
-              " my max Price is: " +
-              priceObject[key]
-          );
+          //sendNotification(itemTitle +" is too expensive at " + itemPrice + " my max Price is: " + priceObject[key]);
+          reloadCurrentPageAfterSpecifiedTimeout(); 
         }
       }
     }
   } else {
     console.log("no button found :(");
-    setTimeout(function () {
-      location.reload();
-    }, timeoutTime);
+    reloadCurrentPageAfterSpecifiedTimeout(); 
   }
+}
+
+function requestNotificationPermissionIfDefault(){
+  if(Notification.permission == 'default'){
+    Notification.requestPermission(); 
+  }
+}
+
+function sendNotification(notificationMessage){
+  new Notification(notificationMessage).onclick = function () {
+    window.focus();
+  }; 
+}
+
+function cleanUpItemPrice(itemPrice){
+  itemPrice = itemPrice.replace(",", ".");
+  itemPrice = itemPrice.replace("€", "");
+  itemPrice = itemPrice.replace("$", "");
+  itemPrice = itemPrice.replace("EUR ", ""); 
+  return itemPrice; 
+}
+
+function reloadCurrentPageAfterSpecifiedTimeout(){
+  setTimeout(function () {
+    location.reload();
+  }, timeoutTime);
 }
