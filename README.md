@@ -1,15 +1,17 @@
-# Amazon Watch
+# Price Watch
 
-A small Python service that watches Amazon products and sends a push notification through
-[ntfy](https://ntfy.sh) when an offer reaches your price limit. It tracks two limits per product:
+A small Python service that sends push notifications through [ntfy](https://ntfy.sh) for:
 
-- **New**: the cheapest offer in "New" condition, from any seller
-- **Warehouse**: the cheapest offer sold by Amazon Warehouse (also called Amazon Resale / Retourenkauf)
+- **Amazon products**, with two price limits per product:
+  - **New**: the cheapest offer in "New" condition, from any seller
+  - **Warehouse**: the cheapest offer sold by Amazon Warehouse (also called Amazon Resale / Retourenkauf)
+- **Apple Certified Refurbished**: new listings on a refurbished category page whose title
+  matches your keywords, with an optional price limit (see [Apple refurbished](#apple-refurbished))
 
 It only notifies you and never buys anything. The old Chrome extension that auto-bought
 items is still in the git history (commit `7922bcd`).
 
-## How it works
+## How it works (Amazon)
 
 In each round the watcher makes **one request per product** to Amazon's offer list (the "All
 offers" panel on a product page). It reads every offer's price, condition and seller, keeps the
@@ -27,22 +29,22 @@ the first round it also loads the Amazon homepage once to get normal session coo
 ## Install on a Linux server
 
 ```bash
-sudo useradd --system --home /opt/amazon-watch --shell /usr/sbin/nologin amazonwatch
-sudo git clone -b claude/epic-mayer-wtcn80 https://github.com/s1r-mar71n/AmazonBot /opt/amazon-watch
-cd /opt/amazon-watch
+sudo useradd --system --home /opt/price-watch --shell /usr/sbin/nologin pricewatch
+sudo git clone -b claude/epic-mayer-wtcn80 https://github.com/s1r-mar71n/AmazonBot /opt/price-watch
+cd /opt/price-watch
 sudo python3 -m venv .venv                       # Python 3.11+ (needs tomllib)
 sudo .venv/bin/pip install -r requirements.txt
 sudo cp config.example.toml config.toml && sudo nano config.toml
-sudo chown -R amazonwatch:amazonwatch /opt/amazon-watch
+sudo chown -R pricewatch:pricewatch /opt/price-watch
 
 # test it
-sudo -u amazonwatch .venv/bin/python amazon_watch.py --test-notify     # should buzz your phone
-sudo -u amazonwatch .venv/bin/python amazon_watch.py --once --dry-run  # one round, logs alerts only
+sudo -u pricewatch .venv/bin/python watch.py --test-notify        # should buzz your phone
+sudo -u pricewatch .venv/bin/python watch.py --once --dry-run -v  # one round, logs alerts only
 
 # run as a service
-sudo cp deploy/amazon-watch.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now amazon-watch
-journalctl -u amazon-watch -f
+sudo cp deploy/price-watch.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now price-watch
+journalctl -u price-watch -f
 ```
 
 It uses about 50 MB of RAM and needs two dependencies:
@@ -71,6 +73,31 @@ max_warehouse = 250
 ```
 
 Leave out `max_new` or `max_warehouse` to ignore that kind of offer.
+
+## Apple refurbished
+
+```toml
+[[apple]]
+url = "https://www.apple.com/de/shop/refurbished/mac/mac-studio"
+match = ["Mac Studio"]      # every word must appear in the listing title
+# exclude = ["M2"]          # skip titles containing any of these
+# max_price = 2500          # optional price limit
+```
+
+- **Why `match` is required:** when a category is sold out, Apple doesn't show an empty page. It
+  shows the whole parent category (all refurbished Macs) on the same URL, so the watcher filters
+  listings by their title.
+- **One alert per listing:** each listing (Apple part number) alerts once. It alerts again if its
+  price drops, or if it disappears and comes back later.
+- **Prices in alerts:** alerts show the refurbished price, plus the original price and the
+  discount where Apple lists them.
+- **Shared requests:** each distinct URL is fetched once per round, every `apple_interval_minutes`
+  (default 10, minimum 2). Several `[[apple]]` entries with the same URL share that one request.
+- **Faster than Amazon:** Apple pages run on their own schedule, so Apple can be checked more often
+  than Amazon. Refurbished Mac Studios often sell out within hours.
+- **Blocking is rarely an issue:** Apple's store has no Amazon-style CAPTCHA wall, and 6–12
+  requests an hour is negligible traffic. If Apple answers 403/429/503, the watcher backs off
+  (15 min, doubling up to 2 h) and sends you one warning.
 
 ## Amazon rate limits: read this before adding many products
 
@@ -112,10 +139,12 @@ blocked (up to 6 hours), and continues normally once requests succeed again.
 
 ## Limitations
 
-- **Untested against live Amazon.** The page parsing was written for Amazon's current offer-list
-  markup but not checked against live pages, because Amazon was unreachable from the environment
-  where this was built. Run `--once --dry-run -v` first. If it logs `no offers parsed` for a
-  product that's in stock, the HTML selectors in `parse_offers()` need adjusting.
+- **Untested against live Amazon or Apple.** Neither site was reachable from the environment where
+  this was built. The Amazon parser targets Amazon's current offer-list markup. The Apple parser
+  uses the selectors of the maintained [`refurbished`](https://pypi.org/project/refurbished/)
+  package, and falls back to the JSON data the page is built from. Run `--once --dry-run -v` first.
+  If it logs `no offers parsed` (Amazon) or `no tiles parsed` (Apple), the selectors in
+  `parse_offers()` / `parse_refurb()` need adjusting.
 - **Shipping costs are ignored.** Only the item price is compared with your limit.
 - **Only the first page of offers is read** (about 10 offers, cheapest first). For products with
   many sellers, a Warehouse offer could in theory sit beyond that first page.

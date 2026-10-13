@@ -1,7 +1,8 @@
 """Unit tests for the parsing helpers.
 
 The AOD snippet below is hand-written to mirror Amazon's offer-list markup;
-it checks our parsing logic, not that Amazon still serves this exact markup."""
+it checks our parsing logic, not that Amazon still serves this exact markup.
+The Apple snippets follow the selectors used by the `refurbished` PyPI package."""
 
 import sys
 import unittest
@@ -9,8 +10,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from amazon_watch import (DEFAULT_WAREHOUSE_IDS, DEFAULT_WAREHOUSE_SELLERS,  # noqa: E402
-                          extract_asin, parse_offers, parse_price)
+from watch import (DEFAULT_WAREHOUSE_IDS, DEFAULT_WAREHOUSE_SELLERS, AppleWatch,  # noqa: E402
+                   apple_matches, extract_asin, parse_offers, parse_price, parse_refurb)
 
 AOD = """
 <div id="aod-asin-title-text">Some Graphics Card 16GB</div>
@@ -62,6 +63,48 @@ class ParseOffers(unittest.TestCase):
         self.assertEqual(title, "Some Graphics Card 16GB")
         got = [(o.price, o.kind) for o in offers]
         self.assertEqual(got, [(1049.0, "new"), (899.9, "warehouse"), (999.0, "new"), (700.0, "other")])
+
+
+# Mac Studio has no stock, so Apple shows the whole Mac category instead.
+REFURB_GRID = """
+<link rel="canonical" href="https://www.apple.com/de/shop/refurbished/mac">
+<div class="refurbished-category-grid-no-js"><ul>
+  <li><h3><a href="/de/shop/product/FXNE3D/A/refurb-mac-mini-apple-m4-chip?fnode=abc">Mac mini mit Apple M4 Chip mit 10‑Core CPU (generalüberholt)</a></h3>
+      <div><span class="as-price-currentprice">599,00&nbsp;€</span>
+           <span class="as-price-previousprice">Ursprünglich 699,00 €</span></div></li>
+  <li><h3><a href="/de/shop/product/FXCR3D/A/refurb-macbook-air">13" MacBook Air mit Apple M3 Chip (generalüberholt)</a></h3>
+      <div>1.049,00 €</div></li>
+</ul></div>
+"""
+
+REFURB_JSON = """<script>window.REFURB_GRID_BOOTSTRAP = {"tiles": [
+ {"title": "Mac Studio mit Apple M4 Max Chip (generalüberholt)",
+  "productDetailsUrl": "/de/shop/product/FX123D/A/refurb-mac-studio",
+  "price": {"currentPrice": {"amount": "1.869,00 €", "raw_amount": "1869.00"},
+            "previousPrice": {"amount": "2.199,00 €", "raw_amount": "2199.00"}}}]};</script>"""
+
+PAGE = "https://www.apple.com/de/shop/refurbished/mac/mac-studio"
+
+
+class ParseRefurb(unittest.TestCase):
+    def test_grid(self):
+        items = parse_refurb(REFURB_GRID, PAGE)
+        self.assertEqual([(i.part, i.price, i.previous_price) for i in items],
+                         [("FXNE3D", 599.0, 699.0), ("FXCR3D", 1049.0, None)])
+        self.assertEqual(items[0].url, "https://www.apple.com/de/shop/product/FXNE3D/A/refurb-mac-mini-apple-m4-chip")
+
+    def test_filter_ignores_fallback_listing(self):
+        items = parse_refurb(REFURB_GRID, PAGE)
+        studio = AppleWatch(PAGE, ["Mac Studio"], [], None)
+        mini = AppleWatch(PAGE, ["Mac mini"], [], 650)
+        self.assertEqual([i.part for i in items if apple_matches(i, studio)], [])
+        self.assertEqual([i.part for i in items if apple_matches(i, mini)], ["FXNE3D"])
+        self.assertFalse(apple_matches(items[0], AppleWatch(PAGE, ["Mac mini"], [], 500)))
+        self.assertFalse(apple_matches(items[0], AppleWatch(PAGE, ["Mac mini"], ["M4"], None)))
+
+    def test_json_fallback(self):
+        [item] = parse_refurb(REFURB_JSON, PAGE)
+        self.assertEqual((item.part, item.price, item.previous_price), ("FX123D", 1869.0, 2199.0))
 
 
 if __name__ == "__main__":

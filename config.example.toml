@@ -15,7 +15,9 @@ renotify_hours   = 12               # repeat an alert if the deal is still there
 # warehouse_sellers    = ["amazon warehouse", "amazon resale", "warehouse deals", "amazon retourenkauf"]
 # warehouse_seller_ids = ["A8KICS1PHF7ZO"]
 # state_file = "state.json"
+apple_interval_minutes = 10        # Apple refurbished pages (one request per distinct URL)
 
+# ---------------------------------------------------------------- Amazon
 # One block per product. Short links (amzn.eu/d/...) and full links both work.
 # Set max_new, max_warehouse or both; leave one out to ignore that kind of offer.
 
@@ -28,3 +30,20 @@ max_warehouse = 250
 # [[product]]
 # url = "https://www.amazon.de/dp/B0XXXXXXXX"
 # max_warehouse = 120
+
+# ---------------------------------------------------------------- Apple refurbished
+# Alerts once per new listing whose title contains ALL `match` words (case-insensitive)
+# and NONE of the `exclude` words. A listing alerts again if its price drops, or if it
+# disappears and comes back.
+# Important: when a category is sold out, Apple shows the whole parent category
+# (e.g. all Macs) on that URL, so `match` is what keeps you from getting spammed.
+
+[[apple]]
+url = "https://www.apple.com/de/shop/refurbished/mac/mac-studio"
+match = ["Mac Studio"]
+# exclude = ["M2"]
+# max_price = 2500
+
+[[apple]]
+url = "https://www.apple.com/de/shop/refurbished/mac/mac-mini"
+match = ["Mac mini"]

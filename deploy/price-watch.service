@@ -1,0 +1,24 @@
+[Unit]
+Description=Amazon + Apple refurbished price watcher (ntfy alerts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pricewatch
+Group=pricewatch
+WorkingDirectory=/opt/price-watch
+ExecStart=/opt/price-watch/.venv/bin/python /opt/price-watch/watch.py --config /opt/price-watch/config.toml
+Restart=on-failure
+RestartSec=120
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/price-watch
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target
