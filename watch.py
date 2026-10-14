@@ -529,7 +529,10 @@ def notify(cfg: dict, title: str, message: str, click: str | None = None,
         except Exception as e:
             log.error("ntfy delivery failed: %s", e)
     if tg.get("bot_token") and tg.get("chat_id"):
-        body = {"chat_id": tg["chat_id"], "text": f"{title}\n{message}",
+        # The link also goes in the text: Telegram asks "Open this link?" before following a
+        # button, while a URL in the text opens with one tap (same as immocrawler's alerts).
+        text = f"{title}\n{message}" + (f"\n{click}" if click else "")
+        body = {"chat_id": tg["chat_id"], "text": text,
                 "disable_web_page_preview": True, "disable_notification": priority < 3}
         if click:
             body["reply_markup"] = {"inline_keyboard": [[{"text": "Open", "url": click}]]}
