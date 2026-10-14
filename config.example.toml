@@ -1,0 +1,49 @@
+# Copy to config.toml and edit. The watcher re-reads this file every round,
+# so you can add/remove products without restarting the service.
+
+[ntfy]
+server = "https://ntfy.sh"          # or your self-hosted ntfy
+topic  = "change-me-to-something-unguessable"
+# token = "tk_..."                  # only if your topic requires auth
+
+[settings]
+interval_minutes = 20               # one round = one request per product
+jitter_minutes   = 5                # +/- randomisation of the interval
+delay_between_products_seconds = [20, 60]
+renotify_hours   = 12               # repeat an alert if the deal is still there (sooner if price drops further)
+# accept_language = "de-DE,de;q=0.9,en;q=0.8"
+# warehouse_sellers    = ["amazon warehouse", "amazon resale", "warehouse deals", "amazon retourenkauf"]
+# warehouse_seller_ids = ["A8KICS1PHF7ZO"]
+# state_file = "state.json"
+apple_interval_minutes = 10        # Apple refurbished pages (one request per distinct URL)
+
+# ---------------------------------------------------------------- Amazon
+# One block per product. Short links (amzn.eu/d/...) and full links both work.
+# Set max_new, max_warehouse or both; leave one out to ignore that kind of offer.
+
+[[product]]
+url = "https://amzn.eu/d/01xSbc0F"
+name = "Example product"            # optional; otherwise the Amazon title is used
+max_new = 300
+max_warehouse = 250
+
+# [[product]]
+# url = "https://www.amazon.de/dp/B0XXXXXXXX"
+# max_warehouse = 120
+
+# ---------------------------------------------------------------- Apple refurbished
+# Alerts once per new listing whose title contains ALL `match` words (case-insensitive)
+# and NONE of the `exclude` words. A listing alerts again if its price drops, or if it
+# disappears and comes back.
+# Important: when a category is sold out, Apple shows the whole parent category
+# (e.g. all Macs) on that URL, so `match` is what keeps you from getting spammed.
+
+[[apple]]
+url = "https://www.apple.com/de/shop/refurbished/mac/mac-studio"
+match = ["Mac Studio"]
+# exclude = ["M2"]
+# max_price = 2500
+
+[[apple]]
+url = "https://www.apple.com/de/shop/refurbished/mac/mac-mini"
+match = ["Mac mini"]
