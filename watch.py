@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Price/stock watcher with ntfy alerts. Notify-only: never buys.
+"""Price/stock watcher with ntfy and/or Telegram alerts. Notify-only: never buys.
 
 - Amazon: cheapest New and Amazon Warehouse offer vs. your price limits.
 - Apple Certified Refurbished: new listings whose title matches your keywords."""
@@ -11,7 +11,6 @@ import random
 import re
 import sys
 import time
-import tomllib
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +19,11 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
+try:
+    import tomllib
+except ImportError:  # Python 3.10
+    import tomli as tomllib
+
 log = logging.getLogger("watch")
 
 ASIN_RE = re.compile(r"/(?:dp|gp/product|gp/aw/d|o/ASIN)/([A-Z0-9]{10})(?:[/?#]|$)")
@@ -27,9 +31,10 @@ SHORT_HOSTS = {"amzn.eu", "amzn.to", "amzn.com", "a.co"}
 NEW_WORDS = {"new", "neu", "neuf", "nuevo", "nuovo", "nieuw", "nowy"}
 DEFAULT_WAREHOUSE_SELLERS = ["amazon warehouse", "amazon resale", "warehouse deals", "amazon retourenkauf"]
 DEFAULT_WAREHOUSE_IDS = ["A8KICS1PHF7ZO"]  # Amazon Warehouse on amazon.de
-CAPTCHA_MARKERS = ("validateCaptcha", "api-services-support@amazon.com", "<title>Robot Check</title>")
+# Not "api-services-support@amazon.com": Amazon's ordinary 404 page carries it in a comment.
+CAPTCHA_MARKERS = ("validateCaptcha", "<title>Robot Check</title>")
 
-MIN_INTERVAL_MINUTES = 5
+MIN_INTERVAL_MINUTES = 2
 MIN_APPLE_INTERVAL_MINUTES = 2
 BACKOFF_START = 30 * 60
 BACKOFF_MAX = 6 * 3600
@@ -98,10 +103,11 @@ def load_config(path: Path) -> dict:
     if settings["apple_interval_minutes"] < MIN_APPLE_INTERVAL_MINUTES:
         settings["apple_interval_minutes"] = MIN_APPLE_INTERVAL_MINUTES
 
-    ntfy = cfg.get("ntfy") or {}
-    if not ntfy.get("topic"):
-        raise ValueError("[ntfy] topic is required")
+    ntfy = cfg.setdefault("ntfy", {})
     ntfy.setdefault("server", "https://ntfy.sh")
+    tg = cfg.setdefault("telegram", {})
+    if not ntfy.get("topic") and not (tg.get("bot_token") and tg.get("chat_id")):
+        raise ValueError("set [ntfy] topic and/or [telegram] bot_token + chat_id")
 
     products = []
     for i, p in enumerate(cfg.get("product", []), 1):
@@ -142,26 +148,30 @@ def extract_asin(url: str) -> str | None:
     return m.group(1) if m else None
 
 
-def classify(condition: str, seller: str, seller_id: str, wh_names, wh_ids) -> str:
+def classify(condition: str, seller: str, seller_id: str, wh_names, wh_ids, wh_link: bool = False) -> str:
     seller_l = seller.lower()
-    if seller_id in wh_ids or any(n in seller_l for n in wh_names):
+    if wh_link or seller_id in wh_ids or any(n in seller_l for n in wh_names):
         return "warehouse"
     first = re.split(r"[\s\-–:]+", condition.strip().lower(), maxsplit=1)[0] if condition.strip() else ""
     return "new" if first in NEW_WORDS else "other"
 
 
 def _text(el) -> str:
-    return el.get_text(" ", strip=True) if el else ""
+    return re.sub(r"\s+", " ", el.get_text(" ", strip=True)) if el else ""
 
 
 def _offer_price(el) -> float | None:
-    for sel in (".a-price .a-offscreen", ".a-price .aok-offscreen", ".aok-offscreen"):
-        p = parse_price(_text(el.select_one(sel)))
-        if p:
-            return p
-    whole = _text(el.select_one(".a-price-whole"))
-    frac = _text(el.select_one(".a-price-fraction"))
-    return parse_price(f"{whole.rstrip('.,')},{frac or '00'}") if whole else None
+    for p in el.select(".a-price"):
+        if "a-text-price" in p.get("class", []) or p.get("data-a-strike"):
+            continue  # struck-through list price (UVP)
+        price = parse_price(_text(p.select_one(".a-offscreen")))  # often empty nowadays
+        if price:
+            return price
+        whole = _text(p.select_one(".a-price-whole"))
+        if whole:
+            return parse_price(f"{whole.rstrip(' .,')},{_text(p.select_one('.a-price-fraction')) or '00'}")
+    # e.g. "2.747,90 € mit 9 Prozent Einsparungen": take the first price token only.
+    return first_price(_text(el.select_one(".apex-pricetopay-accessibility-label")))
 
 
 def parse_offers(html: str, wh_names, wh_ids) -> tuple[str | None, list[Offer]]:
@@ -176,12 +186,17 @@ def parse_offers(html: str, wh_names, wh_ids) -> tuple[str | None, list[Offer]]:
             continue
         condition = _text(el.select_one("#aod-offer-heading"))
         sold_by = el.select_one("#aod-offer-soldBy")
-        link = sold_by.select_one("a[href]") if sold_by else None
-        seller = _text(link) or _text(sold_by.select_one(".a-col-right") if sold_by else None)
+        # The seller column's first entry is the seller: a <span> for Amazon itself, a link otherwise
+        # (to /gp/aag/main?seller=... for marketplace sellers, to /Warehouse-Deals/ for Amazon
+        # Retourenkauf, which carries no seller id). A "return policy" link follows it.
+        name = sold_by.select_one(".a-col-right > span, .a-col-right > a") if sold_by else None
+        seller = _text(name) or _text(sold_by)
+        link = sold_by.select_one("a[href*='seller=']") if sold_by else None
         m = re.search(r"seller=([A-Z0-9]+)", link["href"]) if link else None
         seller_id = m.group(1) if m else ""
+        wh_link = bool(sold_by and sold_by.select_one("a[href*='Warehouse-Deals']"))
         offers.append(Offer(price, condition, seller, seller_id,
-                            classify(condition, seller, seller_id, wh_names, wh_ids)))
+                            classify(condition, seller, seller_id, wh_names, wh_ids, wh_link)))
     return title, offers
 
 
@@ -220,9 +235,8 @@ class Amazon:
 
     def offers(self, host: str, asin: str):
         self.warm_up(host)
-        url = (f"https://{host}/gp/product/ajax/ref=dp_aod_ALL_mbc?asin={asin}"
-               "&m=&qid=&smid=&sourcecustomerorglistid=&sourcecustomerorglistitemid=&sr=&pc=dp"
-               "&experienceId=aodAjaxMain")
+        url = (f"https://{host}/gp/product/ajax/aodAjaxMain/ref=dp_aod_ALL_mbc?asin={asin}"
+               "&m=&qid=&smid=&sourcecustomerorglistid=&sourcecustomerorglistitemid=&sr=&pc=dp")
         return self.get(url, headers={"Referer": f"https://{host}/dp/{asin}"}).text
 
 
@@ -247,6 +261,10 @@ def _refurb_item(title: str, url: str, price, previous) -> RefurbItem:
     url = urljoin(url, urlparse(url).path)  # drop query/fragment
     m = re.search(r"/shop/product/([^/]+)", url)
     return RefurbItem(title, url, m.group(1) if m else url, price, previous)
+
+
+def _strip_tags(s: str | None) -> str:
+    return re.sub(r"<[^>]+>", " ", s or "")
 
 
 def parse_refurb(html: str, page_url: str) -> list[RefurbItem]:
@@ -280,15 +298,24 @@ def parse_refurb(html: str, page_url: str) -> list[RefurbItem]:
             if t.get("title") and t.get("productDetailsUrl"):
                 items.append(_refurb_item(
                     t["title"], urljoin(page_url, t["productDetailsUrl"]),
-                    _num(cur.get("raw_amount")) or first_price(cur.get("amount")),
-                    _num(prev.get("raw_amount")) or first_price(prev.get("amount"))))
+                    _num(cur.get("raw_amount")) or first_price(_strip_tags(cur.get("amount"))),
+                    # previousPrice.raw_amount is the CURRENT price; the original is elsewhere.
+                    _num(p.get("originalProductAmount"))
+                    or first_price(_strip_tags(prev.get("previousPrice") or prev.get("amount")))))
     return items
 
 
+def _norm(s: str) -> str:
+    """Lowercase and fold Apple's typography: 'Mac\\xa0mini' (no-break space), soft
+    hyphens and non-breaking hyphens would otherwise defeat plain substring matching."""
+    s = s.replace("­", "").replace("‑", "-")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
 def apple_matches(item: RefurbItem, w: AppleWatch) -> bool:
-    t = item.title.lower()
-    return (all(k.lower() in t for k in w.match)
-            and not any(k.lower() in t for k in w.exclude)
+    t = _norm(item.title)
+    return (all(_norm(k) in t for k in w.match)
+            and not any(_norm(k) in t for k in w.exclude)
             and (w.max_price is None or (item.price is not None and item.price <= w.max_price)))
 
 
@@ -336,7 +363,7 @@ def apple_round(session, cfg: dict, state: dict, dry_run: bool) -> bool:
             msg = f"{it.price:.2f}" if it.price is not None else "price unknown"
             if it.previous_price and it.price and it.previous_price > it.price:
                 msg += f" (was {it.previous_price:.2f}, -{1 - it.price / it.previous_price:.0%})"
-            ntfy(cfg, f"Refurb: {it.title}", msg, click=it.url, tags=["apple"], dry_run=dry_run)
+            notify(cfg, f"Refurb: {it.title}", msg, click=it.url, tags=["apple"], dry_run=dry_run)
         # Forget listings that disappeared, so they alert again if they come back.
         seen[url] = {part: it.price for part, it in matched.items()}
     return ok
@@ -344,26 +371,39 @@ def apple_round(session, cfg: dict, state: dict, dry_run: bool) -> bool:
 
 # --------------------------------------------------------------------------- notifications
 
-def ntfy(cfg: dict, title: str, message: str, click: str | None = None,
-         priority: int = 4, tags: list[str] | None = None, dry_run: bool = False):
-    n = cfg["ntfy"]
-    body = {"topic": n["topic"], "title": title, "message": message,
-            "priority": priority, "tags": tags or []}
-    if click:
-        body["click"] = click
+def _post_json(url: str, body: dict, headers: dict | None = None):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", **(headers or {})})
+    urllib.request.urlopen(req, timeout=15).close()
+
+
+def notify(cfg: dict, title: str, message: str, click: str | None = None,
+           priority: int = 4, tags: list[str] | None = None, dry_run: bool = False):
+    """Send to every configured channel: ntfy and/or Telegram."""
     if dry_run:
-        log.info("[dry-run] ntfy: %s | %s", title, message)
+        log.info("[dry-run] notify: %s | %s", title, message)
         return
-    headers = {"Content-Type": "application/json"}
-    if n.get("token"):
-        headers["Authorization"] = f"Bearer {n['token']}"
-    # JSON publishing avoids header-encoding trouble with € and umlauts.
-    req = urllib.request.Request(n["server"].rstrip("/"), data=json.dumps(body).encode(),
-                                 headers=headers, method="POST")
-    try:
-        urllib.request.urlopen(req, timeout=15).close()
-    except Exception as e:
-        log.error("ntfy delivery failed: %s", e)
+    n, tg = cfg["ntfy"], cfg["telegram"]
+    if n.get("topic"):
+        body = {"topic": n["topic"], "title": title, "message": message,
+                "priority": priority, "tags": tags or []}
+        if click:
+            body["click"] = click
+        # JSON publishing avoids header-encoding trouble with € and umlauts.
+        try:
+            _post_json(n["server"].rstrip("/"), body,
+                       {"Authorization": f"Bearer {n['token']}"} if n.get("token") else None)
+        except Exception as e:
+            log.error("ntfy delivery failed: %s", e)
+    if tg.get("bot_token") and tg.get("chat_id"):
+        body = {"chat_id": tg["chat_id"], "text": f"{title}\n{message}",
+                "disable_web_page_preview": True, "disable_notification": priority < 3}
+        if click:
+            body["reply_markup"] = {"inline_keyboard": [[{"text": "Open", "url": click}]]}
+        try:
+            _post_json(f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage", body)
+        except Exception as e:  # str(e) can contain the URL, i.e. the bot token: log the type only
+            log.error("telegram delivery failed: %s", type(e).__name__)
 
 
 # --------------------------------------------------------------------------- main loop
@@ -412,7 +452,7 @@ def check_product(amz: Amazon, p: Product, cfg: dict, state: dict, dry_run: bool
             if prev is None or o.price < prev["price"] - 0.005 or now - prev["ts"] > s["renotify_hours"] * 3600:
                 label = "Warehouse" if kind == "warehouse" else "New"
                 msg = f"{o.price:.2f} (limit {limit:.2f})\n{o.condition or label} · {o.seller or 'unknown seller'}"
-                ntfy(cfg, f"{label}: {name}", msg, click=f"https://{host}/dp/{asin}",
+                notify(cfg, f"{label}: {name}", msg, click=f"https://{host}/dp/{asin}",
                      tags=["moneybag"] if kind == "new" else ["package"], dry_run=dry_run)
                 alerts[key] = {"price": o.price, "ts": now}
         else:
@@ -448,7 +488,7 @@ def _block_notice(cfg, state, source: str, blocked: bool, backoff: int, dry_run:
     """Send one warning per blocked period, and clear it once requests work again."""
     key = f"{source}_block_notified"
     if blocked and not state.get(key):
-        ntfy(cfg, f"{source.title()} watcher blocked",
+        notify(cfg, f"{source.title()} watcher blocked",
              f"Requests are being refused. Pausing {backoff // 60} min, backing off further if it persists.",
              priority=3, tags=["warning"], dry_run=dry_run)
         state[key] = True
@@ -507,13 +547,13 @@ def main():
     ap.add_argument("-c", "--config", default="config.toml", type=Path)
     ap.add_argument("--once", action="store_true", help="run a single round and exit")
     ap.add_argument("--dry-run", action="store_true", help="log alerts instead of sending them")
-    ap.add_argument("--test-notify", action="store_true", help="send a test ntfy message and exit")
+    ap.add_argument("--test-notify", action="store_true", help="send a test notification and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if args.test_notify:
-        ntfy(load_config(args.config), "Price watcher", "Test notification - ntfy works.", tags=["white_check_mark"])
+        notify(load_config(args.config), "Price watcher", "Test notification - alerts work.", tags=["white_check_mark"])
         return
     try:
         run(args.config, args.once, args.dry_run)

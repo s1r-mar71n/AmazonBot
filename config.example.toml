@@ -1,10 +1,15 @@
 # Copy to config.toml and edit. The watcher re-reads this file every round,
 # so you can add/remove products without restarting the service.
 
+# Alerts go to every channel configured here: ntfy, Telegram, or both.
 [ntfy]
 server = "https://ntfy.sh"          # or your self-hosted ntfy
 topic  = "change-me-to-something-unguessable"
 # token = "tk_..."                  # only if your topic requires auth
+
+# [telegram]
+# bot_token = "123456:ABC..."       # from @BotFather; the bot must be able to post to chat_id
+# chat_id   = "-100..."             # a channel/group id, or your own user id
 
 [settings]
 interval_minutes = 20               # one round = one request per product

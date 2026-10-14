@@ -1,6 +1,6 @@
 # Price Watch
 
-A small Python service that sends push notifications through [ntfy](https://ntfy.sh) for:
+A small Python service that sends push notifications through [ntfy](https://ntfy.sh) and/or Telegram for:
 
 - **Amazon products**, with two price limits per product:
   - **New**: the cheapest offer in "New" condition, from any seller
@@ -32,7 +32,7 @@ the first round it also loads the Amazon homepage once to get normal session coo
 sudo useradd --system --home /opt/price-watch --shell /usr/sbin/nologin pricewatch
 sudo git clone -b claude/epic-mayer-wtcn80 https://github.com/s1r-mar71n/AmazonBot /opt/price-watch
 cd /opt/price-watch
-sudo python3 -m venv .venv                       # Python 3.11+ (needs tomllib)
+sudo python3 -m venv .venv                       # Python 3.10+
 sudo .venv/bin/pip install -r requirements.txt
 sudo cp config.example.toml config.toml && sudo nano config.toml
 sudo chown -R pricewatch:pricewatch /opt/price-watch
@@ -60,6 +60,24 @@ for x86_64 and ARM64, so a Raspberry Pi 4/5 works too.
    `server` and `token`.
 
 Each alert opens the product page when you tap it.
+
+## Telegram setup
+
+Set `[telegram] bot_token` and `chat_id`. The bot must be allowed to post to that chat; for a
+channel, make it an admin. Alerts carry an "Open" button with the product link. If both ntfy and
+Telegram are configured, alerts go to both.
+
+## Run from cron (no root)
+
+Instead of the systemd unit, you can let cron keep the watcher alive, as on the homeserver:
+
+```
+*/2 * * * * flock -n /home/martin/price-watch/run.lock /home/martin/price-watch/deploy/run.sh
+```
+
+`deploy/run.sh` starts `watch.py` with the venv's Python, logs to `watch.log` (rotated at 20 MB),
+and restarts it within 2 minutes after a crash or reboot. Python 3.10 works too (`tomli` is
+installed automatically).
 
 ## Configuration
 
@@ -139,12 +157,10 @@ blocked (up to 6 hours), and continues normally once requests succeed again.
 
 ## Limitations
 
-- **Untested against live Amazon or Apple.** Neither site was reachable from the environment where
-  this was built. The Amazon parser targets Amazon's current offer-list markup. The Apple parser
-  uses the selectors of the maintained [`refurbished`](https://pypi.org/project/refurbished/)
-  package, and falls back to the JSON data the page is built from. Run `--once --dry-run -v` first.
-  If it logs `no offers parsed` (Amazon) or `no tiles parsed` (Apple), the selectors in
-  `parse_offers()` / `parse_refurb()` need adjusting.
+- **Scraped markup changes.** Both parsers were verified against live amazon.de and apple.com/de on
+  2026-10-14 (Amazon's offer list now lives at `/gp/product/ajax/aodAjaxMain`). If the log shows
+  `no offers parsed` (Amazon) or `no tiles parsed` (Apple), the markup has changed again and
+  `parse_offers()` / `parse_refurb()` need adjusting. Run `--once --dry-run -v` after any change.
 - **Shipping costs are ignored.** Only the item price is compared with your limit.
 - **Only the first page of offers is read** (about 10 offers, cheapest first). For products with
   many sellers, a Warehouse offer could in theory sit beyond that first page.
