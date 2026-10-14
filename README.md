@@ -30,7 +30,7 @@ the first round it also loads the Amazon homepage once to get normal session coo
 
 ```bash
 sudo useradd --system --home /opt/price-watch --shell /usr/sbin/nologin pricewatch
-sudo git clone -b claude/epic-mayer-wtcn80 https://github.com/s1r-mar71n/AmazonBot /opt/price-watch
+sudo git clone https://github.com/s1r-mar71n/AmazonBot /opt/price-watch
 cd /opt/price-watch
 sudo python3 -m venv .venv                       # Python 3.10+
 sudo .venv/bin/pip install -r requirements.txt
