@@ -84,6 +84,7 @@ class ShopWatch:
     types: list[str]  # Shopify product_type, e.g. "VGA"; empty = any
     max_price: float | None
     interval_minutes: float | None  # None = settings.shop_interval_minutes
+    sold_out_alerts: bool = False  # also a quiet alert when a new listing appears already sold out
 
 
 @dataclass
@@ -156,7 +157,8 @@ def load_config(path: Path) -> dict:
         interval = w.get("interval_minutes")
         shops.append(ShopWatch(w["url"], as_list(w["match"]), as_list(w.get("exclude")), as_list(w.get("types")),
                                w.get("max_price"),
-                               max(interval, MIN_SHOP_INTERVAL_MINUTES) if interval is not None else None))
+                               max(interval, MIN_SHOP_INTERVAL_MINUTES) if interval is not None else None,
+                               bool(w.get("sold_out_alerts", False))))
     if not products and not apple and not shops:
         raise ValueError("nothing to watch: add [[product]], [[apple]] and/or [[shop]] entries")
     cfg["products"], cfg["apple_watches"], cfg["shop_watches"] = products, apple, shops
@@ -460,8 +462,10 @@ def fetch_shop(session, url: str) -> list[ShopItem] | None:
 
 def shop_round(session, cfg: dict, state: dict, dry_run: bool, watches: list[ShopWatch]) -> bool:
     """Check the given [[shop]] watches. Alerts once per variant when it is (or comes back) in stock,
-    and again if its price drops. Returns False if a store refused us."""
+    and again if its price drops; with sold_out_alerts, quietly when a new listing is already sold out.
+    Returns False if a store refused us."""
     avail = state.setdefault("shop_available", {})  # key -> {"price", "seen"} for in-stock variants
+    listed = state.setdefault("shop_listed", {})  # key -> last seen, for every matching variant
     by_url: dict[str, list[ShopWatch]] = {}
     for w in watches:
         by_url.setdefault(w.url, []).append(w)
@@ -478,14 +482,22 @@ def shop_round(session, cfg: dict, state: dict, dry_run: bool, watches: list[Sho
         if items is None:
             ok = False
             break
-        hits = [it for it in items if any(shop_matches(it, w) for w in ws)]
+        hits = [(it, any(w.sold_out_alerts for w in ws if shop_matches(it, w)))
+                for it in items if any(shop_matches(it, w) for w in ws)]
         log.info("shop: %s: %d variants, %d matching (%d in stock)", url, len(items), len(hits),
-                 sum(it.available for it in hits))
-        matched.update({it.key: it for it in hits})
+                 sum(it.available for it, _ in hits))
+        for it, quiet in hits:
+            matched[it.key] = (it, quiet or matched.get(it.key, (None, False))[1])
 
-    for key, it in matched.items():
+    for key, (it, sold_out_alerts) in matched.items():
+        new_listing = key not in listed
+        listed[key] = now
         if not it.available:
             avail.pop(key, None)  # sold out: alert again when it comes back
+            if new_listing and sold_out_alerts:
+                price = f"{it.price:.2f} €" if it.price is not None else "price unknown"
+                notify(cfg, f"Listed, sold out: {it.title}", f"{price} · {urlparse(it.url).netloc}",
+                       click=it.url, priority=2, tags=["eyes"], dry_run=dry_run)
             continue
         prev = avail.get(key)
         if prev is None or (it.price is not None and prev["price"] is not None and it.price < prev["price"] - 0.005):
@@ -499,6 +511,9 @@ def shop_round(session, cfg: dict, state: dict, dry_run: bool, watches: list[Sho
                    for w in cfg["shop_watches"]] or [0])
     for key in [k for k, v in avail.items() if now - v["seen"] > max(3600, 3 * longest)]:
         del avail[key]
+    # Longer for listings: a store scan failing for an hour shouldn't repeat a sold-out alert.
+    for key in [k for k, seen in listed.items() if now - seen > max(6 * 3600, 3 * longest)]:
+        del listed[key]
     return ok
 
 

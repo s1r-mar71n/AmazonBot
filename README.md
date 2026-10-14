@@ -136,6 +136,9 @@ interval_minutes = 1
 - **Collections hide sold-out products**, and a card can be listed outside the collection (MSI's
   refurbished/outlet cards are), so add a slower `[[shop]]` entry for the store root as a backstop.
   On MSI that's about 4 requests and 4 MB per check, so every 10 minutes is plenty.
+- **Sold-out listings:** with `sold_out_alerts = true`, a new listing that is already sold out
+  sends a quiet alert (silent in Telegram, low priority in ntfy). Only a store-root entry sees
+  these, because collections hide sold-out products.
 - **Blocking:** on HTTP 403/429/430/503 it backs off (15 min, doubling up to 2 h) and sends one warning.
 
 ## Amazon rate limits: read this before adding many products
