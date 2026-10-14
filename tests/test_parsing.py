@@ -176,7 +176,16 @@ class Shopify(unittest.TestCase):
         session.get.return_value = FakeResponse(data)
         with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "sleep"):
             ok = watch.shop_round(session, cfg, state, False, watches)
+        self.last_priorities = [c.kwargs.get("priority") for c in notify.call_args_list]
         return ok, [c.args[1] for c in notify.call_args_list]
+
+    @staticmethod
+    def _5090_in_stock(data, available=True):
+        for p in data["products"]:
+            if "5090" in p["title"] and p["product_type"] == "VGA":
+                for v in p["variants"]:
+                    v["available"] = available
+        return data
 
     def test_alerts_when_5090_comes_in_stock(self):
         sold_out = msi_store()
@@ -204,6 +213,24 @@ class Shopify(unittest.TestCase):
         watches = [ShopWatch(MSI + "/collections/geforce-rtx-5090-series-gpu", ["5090"], [], ["VGA"], None, 1),
                    ShopWatch(MSI, ["5090"], [], ["VGA"], None, 10)]
         self.assertEqual(len(self._round({}, in_stock, watches)[1]), 1)
+
+    def test_quiet_alert_when_listed_sold_out(self):
+        # The real refurbished 5090 is listed and sold out: one quiet alert, then nothing.
+        watches = [ShopWatch(MSI, ["5090"], [], ["VGA"], None, 10, sold_out_alerts=True)]
+        state = {}
+        ok, alerts = self._round(state, msi_store(), watches)
+        self.assertTrue(ok)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(alerts[0].startswith("Listed, sold out: MSI Grafikkarte GeForce RTX 5090"))
+        self.assertEqual(self.last_priorities, [2])  # < 3: Telegram delivers it silently
+        self.assertEqual(self._round(state, msi_store(), watches)[1], [])
+        # Comes into stock: the loud alert. Sells out again: no new quiet alert (not a new listing).
+        self.assertEqual(len(self._round(state, self._5090_in_stock(msi_store()), watches)[1]), 1)
+        self.assertEqual(self.last_priorities, [5])
+        self.assertEqual(self._round(state, msi_store(), watches)[1], [])
+
+    def test_no_sold_out_alert_without_option(self):
+        self.assertEqual(self._round({}, msi_store())[1], [])
 
     def test_blocked(self):
         session = mock.Mock()
