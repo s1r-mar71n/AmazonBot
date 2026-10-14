@@ -2,7 +2,8 @@
 """Price/stock watcher with ntfy and/or Telegram alerts. Notify-only: never buys.
 
 - Amazon: cheapest New and Amazon Warehouse offer vs. your price limits.
-- Apple Certified Refurbished: new listings whose title matches your keywords."""
+- Apple Certified Refurbished: new listings whose title matches your keywords.
+- Shopify stores (e.g. the MSI store): matching products that come into stock."""
 
 import argparse
 import json
@@ -40,6 +41,10 @@ BACKOFF_START = 30 * 60
 BACKOFF_MAX = 6 * 3600
 APPLE_BACKOFF_START = 15 * 60
 APPLE_BACKOFF_MAX = 2 * 3600
+MIN_SHOP_INTERVAL_MINUTES = 1
+SHOP_BACKOFF_START = 15 * 60
+SHOP_BACKOFF_MAX = 2 * 3600
+SHOP_PAGE_SIZE = 250  # Shopify's maximum for products.json
 
 
 class Blocked(Exception):
@@ -72,6 +77,26 @@ class AppleWatch:
 
 
 @dataclass
+class ShopWatch:
+    url: str  # a store root (whole catalogue) or a /collections/<handle> page
+    match: list[str]
+    exclude: list[str]
+    types: list[str]  # Shopify product_type, e.g. "VGA"; empty = any
+    max_price: float | None
+    interval_minutes: float | None  # None = settings.shop_interval_minutes
+
+
+@dataclass
+class ShopItem:
+    key: str  # host/handle/variant id: the same variant seen through two feeds is one item
+    title: str
+    url: str
+    price: float | None
+    available: bool
+    product_type: str
+
+
+@dataclass
 class RefurbItem:
     title: str
     url: str
@@ -96,12 +121,14 @@ def load_config(path: Path) -> dict:
     settings.setdefault("warehouse_seller_ids", DEFAULT_WAREHOUSE_IDS)
     settings.setdefault("state_file", "state.json")
     settings.setdefault("apple_interval_minutes", 10)
+    settings.setdefault("shop_interval_minutes", 5)
     if settings["interval_minutes"] < MIN_INTERVAL_MINUTES:
         log.warning("interval_minutes < %d is asking for CAPTCHAs; using %d",
                     MIN_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES)
         settings["interval_minutes"] = MIN_INTERVAL_MINUTES
     if settings["apple_interval_minutes"] < MIN_APPLE_INTERVAL_MINUTES:
         settings["apple_interval_minutes"] = MIN_APPLE_INTERVAL_MINUTES
+    settings["shop_interval_minutes"] = max(settings["shop_interval_minutes"], MIN_SHOP_INTERVAL_MINUTES)
 
     ntfy = cfg.setdefault("ntfy", {})
     ntfy.setdefault("server", "https://ntfy.sh")
@@ -116,15 +143,23 @@ def load_config(path: Path) -> dict:
         if p.get("max_new") is None and p.get("max_warehouse") is None:
             raise ValueError(f"product #{i}: set max_new and/or max_warehouse")
         products.append(Product(p["url"], p.get("name"), p.get("max_new"), p.get("max_warehouse")))
+    as_list = lambda v: [v] if isinstance(v, str) else list(v or [])
     apple = []
     for i, a in enumerate(cfg.get("apple", []), 1):
         if not a.get("url") or not a.get("match"):
             raise ValueError(f"apple #{i}: url and match are required")
-        as_list = lambda v: [v] if isinstance(v, str) else list(v or [])
         apple.append(AppleWatch(a["url"], as_list(a["match"]), as_list(a.get("exclude")), a.get("max_price")))
-    if not products and not apple:
-        raise ValueError("nothing to watch: add [[product]] and/or [[apple]] entries")
-    cfg["products"], cfg["apple_watches"] = products, apple
+    shops = []
+    for i, w in enumerate(cfg.get("shop", []), 1):
+        if not w.get("url") or not w.get("match"):
+            raise ValueError(f"shop #{i}: url and match are required")
+        interval = w.get("interval_minutes")
+        shops.append(ShopWatch(w["url"], as_list(w["match"]), as_list(w.get("exclude")), as_list(w.get("types")),
+                               w.get("max_price"),
+                               max(interval, MIN_SHOP_INTERVAL_MINUTES) if interval is not None else None))
+    if not products and not apple and not shops:
+        raise ValueError("nothing to watch: add [[product]], [[apple]] and/or [[shop]] entries")
+    cfg["products"], cfg["apple_watches"], cfg["shop_watches"] = products, apple, shops
     return cfg
 
 
@@ -319,7 +354,7 @@ def apple_matches(item: RefurbItem, w: AppleWatch) -> bool:
             and (w.max_price is None or (item.price is not None and item.price <= w.max_price)))
 
 
-def new_apple_session(accept_language: str):
+def new_session(accept_language: str):
     s = requests.Session(impersonate="chrome")
     s.headers.update({"Accept-Language": accept_language})
     return s
@@ -366,6 +401,104 @@ def apple_round(session, cfg: dict, state: dict, dry_run: bool) -> bool:
             notify(cfg, f"Refurb: {it.title}", msg, click=it.url, tags=["apple"], dry_run=dry_run)
         # Forget listings that disappeared, so they alert again if they come back.
         seen[url] = {part: it.price for part, it in matched.items()}
+    return ok
+
+
+# --------------------------------------------------------------------------- shopify stores
+
+def shop_feed_url(url: str, page: int) -> str:
+    """products.json of a collection page, or of the whole store for any other URL."""
+    u = urlparse(url)
+    m = re.match(r"(/(?:[a-z]{2}(?:-[a-z]{2})?/)?collections/[^/?#]+)", u.path)
+    return f"{u.scheme}://{u.netloc}{m.group(1) if m else ''}/products.json?limit={SHOP_PAGE_SIZE}&page={page}"
+
+
+def parse_shop(data: dict, page_url: str) -> list[ShopItem]:
+    """One item per variant of Shopify's products.json. Collections may hide sold-out
+    products; the store-wide feed lists them with available=false."""
+    u = urlparse(page_url)
+    items = []
+    for p in data.get("products", []):
+        variants = p.get("variants") or []
+        for v in variants:
+            title = p["title"]
+            if len(variants) > 1 and v.get("title") and v["title"] != "Default Title":
+                title += f" ({v['title']})"
+            url = f"{u.scheme}://{u.netloc}/products/{p['handle']}"
+            if len(variants) > 1:
+                url += f"?variant={v['id']}"
+            items.append(ShopItem(f"{u.netloc}/{p['handle']}/{v['id']}", title, url, _num(v.get("price")),
+                                  bool(v.get("available")), p.get("product_type") or ""))
+    return items
+
+
+def shop_matches(item: ShopItem, w: ShopWatch) -> bool:
+    t = _norm(item.title)
+    return (all(_norm(k) in t for k in w.match)
+            and not any(_norm(k) in t for k in w.exclude)
+            and (not w.types or item.product_type.lower() in {x.lower() for x in w.types})
+            and (w.max_price is None or (item.price is not None and item.price <= w.max_price)))
+
+
+def fetch_shop(session, url: str) -> list[ShopItem] | None:
+    """All pages of a products.json feed. None if the store refused us."""
+    items = []
+    for page in range(1, 21):
+        if page > 1:
+            time.sleep(random.uniform(2, 5))
+        r = session.get(shop_feed_url(url, page), timeout=30, allow_redirects=True)
+        if r.status_code in (403, 429, 430, 503):  # 430: Shopify's bot protection
+            log.warning("shop: HTTP %d for %s, backing off", r.status_code, url)
+            return None
+        r.raise_for_status()
+        data = r.json()
+        items += parse_shop(data, url)
+        if len(data.get("products", [])) < SHOP_PAGE_SIZE:
+            break
+    return items
+
+
+def shop_round(session, cfg: dict, state: dict, dry_run: bool, watches: list[ShopWatch]) -> bool:
+    """Check the given [[shop]] watches. Alerts once per variant when it is (or comes back) in stock,
+    and again if its price drops. Returns False if a store refused us."""
+    avail = state.setdefault("shop_available", {})  # key -> {"price", "seen"} for in-stock variants
+    by_url: dict[str, list[ShopWatch]] = {}
+    for w in watches:
+        by_url.setdefault(w.url, []).append(w)
+
+    now, ok, matched = time.time(), True, {}
+    for i, (url, ws) in enumerate(by_url.items()):
+        if i:
+            time.sleep(random.uniform(3, 8))
+        try:
+            items = fetch_shop(session, url)
+        except Exception as e:
+            log.error("shop: fetching %s failed: %s", url, e)
+            continue
+        if items is None:
+            ok = False
+            break
+        hits = [it for it in items if any(shop_matches(it, w) for w in ws)]
+        log.info("shop: %s: %d variants, %d matching (%d in stock)", url, len(items), len(hits),
+                 sum(it.available for it in hits))
+        matched.update({it.key: it for it in hits})
+
+    for key, it in matched.items():
+        if not it.available:
+            avail.pop(key, None)  # sold out: alert again when it comes back
+            continue
+        prev = avail.get(key)
+        if prev is None or (it.price is not None and prev["price"] is not None and it.price < prev["price"] - 0.005):
+            price = f"{it.price:.2f} €" if it.price is not None else "price unknown"
+            notify(cfg, f"In stock: {it.title}", f"{price} · {urlparse(it.url).netloc}", click=it.url,
+                   priority=5, tags=["rotating_light"], dry_run=dry_run)
+        avail[key] = {"price": it.price, "seen": now}
+    # Collections hide sold-out products, so "not in this feed" doesn't mean sold out. A variant that
+    # no feed has shown for a while is gone, though: forget it so a relisting alerts again.
+    longest = max([(w.interval_minutes or cfg["settings"]["shop_interval_minutes"]) * 60
+                   for w in cfg["shop_watches"]] or [0])
+    for key in [k for k, v in avail.items() if now - v["seen"] > max(3600, 3 * longest)]:
+        del avail[key]
     return ok
 
 
@@ -503,9 +636,11 @@ def run(config_path: Path, once: bool, dry_run: bool):
     if "block_notified" in state:  # key name used before Apple support
         state["amazon_block_notified"] = state.pop("block_notified")
     amz = Amazon(cfg["settings"]["accept_language"])
-    apple = new_apple_session(cfg["settings"]["accept_language"])
-    amz_backoff = apple_backoff = 0
-    next_amz = next_apple = 0.0
+    apple = new_session(cfg["settings"]["accept_language"])
+    shop = new_session(cfg["settings"]["accept_language"])
+    amz_backoff = apple_backoff = shop_backoff = 0
+    next_amz = next_apple = shop_paused_until = 0.0
+    next_shop: dict[str, float] = {}  # per watch URL
 
     while True:
         try:
@@ -519,7 +654,7 @@ def run(config_path: Path, once: bool, dry_run: bool):
             apple_backoff = 0 if ok else _backoff(apple_backoff, APPLE_BACKOFF_START, APPLE_BACKOFF_MAX)
             _block_notice(cfg, state, "apple", not ok, apple_backoff, dry_run)
             if not ok:
-                apple = new_apple_session(s["accept_language"])
+                apple = new_session(s["accept_language"])
             next_apple = time.time() + (apple_backoff or _jittered(s["apple_interval_minutes"],
                                                                    s["apple_interval_minutes"] * 0.2))
             save_state(state_path, state)
@@ -534,9 +669,24 @@ def run(config_path: Path, once: bool, dry_run: bool):
             next_amz = time.time() + (amz_backoff or _jittered(s["interval_minutes"], s["jitter_minutes"]))
             save_state(state_path, state)
 
+        due_shops = [w for w in cfg["shop_watches"] if time.time() >= next_shop.get(w.url, 0)]
+        if due_shops and time.time() >= shop_paused_until:
+            ok = shop_round(shop, cfg, state, dry_run, due_shops)
+            shop_backoff = 0 if ok else _backoff(shop_backoff, SHOP_BACKOFF_START, SHOP_BACKOFF_MAX)
+            _block_notice(cfg, state, "shop", not ok, shop_backoff, dry_run)
+            if ok:
+                for w in due_shops:
+                    minutes = w.interval_minutes or s["shop_interval_minutes"]
+                    next_shop[w.url] = time.time() + _jittered(minutes, minutes * 0.2)
+            else:
+                shop = new_session(s["accept_language"])
+                shop_paused_until = time.time() + shop_backoff
+            save_state(state_path, state)
+
         if once:
             return
         due = [t for t, on in ((next_apple, cfg["apple_watches"]), (next_amz, cfg["products"])) if on]
+        due += [max(next_shop.get(w.url, 0), shop_paused_until) for w in cfg["shop_watches"]]
         pause = max(min(due) - time.time(), 30)
         log.info("sleeping %.1f min", pause / 60)
         time.sleep(pause)

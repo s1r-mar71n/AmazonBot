@@ -7,6 +7,8 @@ A small Python service that sends push notifications through [ntfy](https://ntfy
   - **Warehouse**: the cheapest offer sold by Amazon Warehouse (also called Amazon Resale / Retourenkauf)
 - **Apple Certified Refurbished**: new listings on a refurbished category page whose title
   matches your keywords, with an optional price limit (see [Apple refurbished](#apple-refurbished))
+- **Shopify stores** such as the MSI store: matching products that come into stock
+  (see [Shopify stores](#shopify-stores-eg-msi))
 
 It only notifies you and never buys anything. The old Chrome extension that auto-bought
 items is still in the git history (commit `7922bcd`).
@@ -116,6 +118,25 @@ match = ["Mac Studio"]      # every word must appear in the listing title
 - **Blocking is rarely an issue:** Apple's store has no Amazon-style CAPTCHA wall, and 6–12
   requests an hour is negligible traffic. If Apple answers 403/429/503, the watcher backs off
   (15 min, doubling up to 2 h) and sends you one warning.
+
+## Shopify stores (e.g. MSI)
+
+```toml
+[[shop]]
+url = "https://de-store.msi.com/collections/geforce-rtx-5090-series-gpu"
+match = ["5090"]            # every word must appear in the product title
+types = ["VGA"]             # Shopify product_type; keeps "RTX 5090 Laptop GPU" laptops out
+interval_minutes = 1
+```
+
+- **How it reads the store:** through Shopify's public `products.json` feed of the collection
+  (or of the whole store, if `url` is the store root), so there's no HTML to break.
+- **One alert per variant:** when it's in stock, again if it sells out and comes back, and on a
+  price drop. The same variant seen through two feeds alerts once.
+- **Collections hide sold-out products**, and a card can be listed outside the collection (MSI's
+  refurbished/outlet cards are), so add a slower `[[shop]]` entry for the store root as a backstop.
+  On MSI that's about 4 requests and 4 MB per check, so every 10 minutes is plenty.
+- **Blocking:** on HTTP 403/429/430/503 it backs off (15 min, doubling up to 2 h) and sends one warning.
 
 ## Amazon rate limits: read this before adding many products
 

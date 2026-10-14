@@ -12,8 +12,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from watch import (DEFAULT_WAREHOUSE_IDS, DEFAULT_WAREHOUSE_SELLERS, AppleWatch,  # noqa: E402
-                   apple_matches, extract_asin, parse_offers, parse_price, parse_refurb)
+import json  # noqa: E402
+from unittest import mock  # noqa: E402
+
+import watch  # noqa: E402
+from watch import (DEFAULT_WAREHOUSE_IDS, DEFAULT_WAREHOUSE_SELLERS, AppleWatch, ShopWatch,  # noqa: E402
+                   apple_matches, extract_asin, parse_offers, parse_price, parse_refurb, parse_shop,
+                   shop_feed_url, shop_matches)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -113,6 +118,100 @@ class ParseRefurb(unittest.TestCase):
         json_items = parse_refurb(no_grid, APPLE_PAGE)
         self.assertEqual(len(json_items), 132)
         self.assertEqual({(i.part, i.price, i.previous_price) for i in json_items}, grid)
+
+
+# MSI's Shopify store. The store fixture is a real subset of the store-wide products.json:
+# every graphics card (product_type VGA) plus everything else with "5090" in the title,
+# with product descriptions (body_html) emptied to keep it small.
+MSI = "https://de-store.msi.com"
+MSI_COLLECTION = MSI + "/collections/geforce-rtx-50-series-gpu?sort_by=price-descending"
+REFURB_5090 = "de-store.msi.com/msi-grafikkarte-geforce-rtx-5090-32g-suprim-liquid-soc_erc/"
+
+
+def msi_store() -> dict:
+    return json.loads(fixture("msi_store_vga_and_5090_20261014.json.gz"))
+
+
+class FakeResponse:
+    def __init__(self, data, status=200):
+        self.status_code, self._data = status, data
+
+    def json(self):
+        return self._data
+
+    def raise_for_status(self):
+        pass
+
+
+class Shopify(unittest.TestCase):
+    def test_feed_url(self):
+        self.assertEqual(shop_feed_url(MSI_COLLECTION, 1),
+                         MSI + "/collections/geforce-rtx-50-series-gpu/products.json?limit=250&page=1")
+        self.assertEqual(shop_feed_url(MSI + "/", 3), MSI + "/products.json?limit=250&page=3")
+
+    def test_collection(self):
+        # On 2026-10-14 the RTX 50 collection listed 14 products, all in stock, no 5090.
+        items = parse_shop(json.loads(fixture("msi_collection_rtx50_20261014.json.gz")), MSI_COLLECTION)
+        self.assertEqual(len(items), 14)
+        self.assertTrue(all(i.available for i in items))
+        five080 = next(i for i in items if i.key.startswith("de-store.msi.com/geforce-rtx-5080-16g-ventus-3x-oc-black/"))
+        self.assertEqual((five080.price, five080.product_type), (1819.0, "VGA"))
+        self.assertEqual(five080.url, MSI + "/products/geforce-rtx-5080-16g-ventus-3x-oc-black")
+        self.assertFalse([i for i in items if shop_matches(i, ShopWatch(MSI, ["5090"], [], ["VGA"], None, None))])
+
+    def test_store_5090_filter(self):
+        # Only the (sold-out) refurbished 5090 card matches; laptops/desktops with an
+        # "RTX 5090 Laptop GPU" are excluded by types = ["VGA"].
+        items = parse_shop(msi_store(), MSI)
+        five090 = [i for i in items if "5090" in i.title]
+        self.assertGreater(len(five090), 1)
+        hits = [i for i in items if shop_matches(i, ShopWatch(MSI, ["5090"], [], ["VGA"], None, None))]
+        self.assertEqual([(i.price, i.available) for i in hits], [(6499.0, False)])
+        self.assertTrue(hits[0].key.startswith(REFURB_5090))
+
+    def _round(self, state, data, watches=None):
+        watches = watches or [ShopWatch(MSI, ["5090"], [], ["VGA"], None, None)]
+        cfg = {"shop_watches": watches, "settings": {"shop_interval_minutes": 1}}
+        session = mock.Mock()
+        session.get.return_value = FakeResponse(data)
+        with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "sleep"):
+            ok = watch.shop_round(session, cfg, state, False, watches)
+        return ok, [c.args[1] for c in notify.call_args_list]
+
+    def test_alerts_when_5090_comes_in_stock(self):
+        sold_out = msi_store()
+        # The only real 5090 card was sold out; flip it to in stock (the one edit to real data).
+        in_stock = msi_store()
+        for p in in_stock["products"]:
+            if "5090" in p["title"] and p["product_type"] == "VGA":
+                for v in p["variants"]:
+                    v["available"] = True
+        state = {}
+        self.assertEqual(self._round(state, sold_out), (True, []))  # sold out: quiet
+        ok, alerts = self._round(state, in_stock)
+        self.assertTrue(ok)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("RTX 5090", alerts[0])
+        self.assertEqual(self._round(state, in_stock)[1], [])  # still in stock: no repeat
+        self._round(state, sold_out)  # sells out ...
+        self.assertEqual(len(self._round(state, in_stock)[1]), 1)  # ... and is back: alert again
+
+    def test_same_variant_through_two_feeds_alerts_once(self):
+        in_stock = msi_store()
+        for p in in_stock["products"]:
+            for v in p["variants"]:
+                v["available"] = True
+        watches = [ShopWatch(MSI + "/collections/geforce-rtx-5090-series-gpu", ["5090"], [], ["VGA"], None, 1),
+                   ShopWatch(MSI, ["5090"], [], ["VGA"], None, 10)]
+        self.assertEqual(len(self._round({}, in_stock, watches)[1]), 1)
+
+    def test_blocked(self):
+        session = mock.Mock()
+        session.get.return_value = FakeResponse({}, status=430)
+        cfg = {"shop_watches": [], "settings": {"shop_interval_minutes": 1}}
+        w = ShopWatch(MSI, ["5090"], [], ["VGA"], None, None)
+        with mock.patch.object(watch, "notify"), mock.patch.object(watch.time, "sleep"):
+            self.assertFalse(watch.shop_round(session, cfg, {}, False, [w]))
 
 
 if __name__ == "__main__":

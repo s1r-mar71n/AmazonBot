@@ -52,3 +52,23 @@ match = ["Mac Studio"]
 [[apple]]
 url = "https://www.apple.com/de/shop/refurbished/mac/mac-mini"
 match = ["Mac mini"]
+
+# ---------------------------------------------------------------- Shopify stores (e.g. MSI)
+# Alerts once when a matching product variant is in stock (again after it sold out, or if its
+# price drops). `url` is a /collections/... page or the store root (whole catalogue).
+# `types` filters on Shopify's product_type ("VGA" = graphics cards at MSI), which keeps
+# laptops with an "RTX 5090 Laptop GPU" out. Collections hide sold-out products, and a card
+# could be listed outside them (refurbished/outlet), so a slower store-wide scan is a good backstop.
+# shop_interval_minutes in [settings] is the default (5); minimum 1.
+
+[[shop]]
+url = "https://de-store.msi.com/collections/geforce-rtx-5090-series-gpu"
+match = ["5090"]
+types = ["VGA"]
+interval_minutes = 1                # tiny feed: cheap to poll
+
+[[shop]]
+url = "https://de-store.msi.com"    # whole store: ~4 requests, ~4 MB
+match = ["5090"]
+types = ["VGA"]
+interval_minutes = 10
