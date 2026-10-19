@@ -36,6 +36,26 @@ max_warehouse = 250
 # url = "https://www.amazon.de/dp/B0XXXXXXXX"
 # max_warehouse = 120
 
+# ---------------------------------------------------------------- Amazon over proxies
+# Products with proxy = true are checked through a proxy pool instead of the home IP: one
+# offer-list request at a time, each proxy at most every per_proxy_interval_minutes. The first
+# refusal (CAPTCHA, WAF/Akamai challenge, any non-200, anything that isn't an offer list) halts
+# that proxy and alerts you. `urls` lists several products that share the limits.
+
+# [proxies]
+# rayobyte_secret = "/home/martin/priceapi/skinbaron-secret.yml"  # reads rayobyte: email + api-key
+# list_file = "proxies.txt"         # or a file of ip:port:user:pass lines
+# per_proxy_interval_minutes = 10   # min 3; the pool sends one request every interval / proxies
+# halt_hours = 24                   # a refused proxy rests this long; doubles on a repeat within a week (max 7 days)
+# breaker_halts = 3                 # this many refusals within breaker_window_hours ...
+# breaker_window_hours = 6
+# breaker_pause_hours = 12          # ... pause the whole pool this long
+
+# [[product]]
+# urls = ["https://www.amazon.de/dp/B0DSQ1RCZV", "https://www.amazon.de/dp/B0DS65VMC6"]
+# max_warehouse = 1400
+# proxy = true                      # needs full /dp/<ASIN> links
+
 # ---------------------------------------------------------------- Apple refurbished
 # Alerts once per new listing whose title contains ALL `match` words (case-insensitive)
 # and NONE of the `exclude` words. A listing alerts again if its price drops, or if it
