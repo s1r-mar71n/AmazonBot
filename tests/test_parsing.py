@@ -1,7 +1,7 @@
 """Unit tests for the parsing helpers.
 
 The fixtures in tests/fixtures/ are real responses captured from amazon.de and apple.com/de on
-2026-10-14 (gzipped; anonymous-session CSRF tokens replaced with REDACTED). If a site changes its
+2026-10-14 and 2026-10-19 (gzipped; anonymous-session CSRF and challenge tokens replaced with REDACTED). If a site changes its
 markup, capture a fresh page into a new fixture rather than hand-editing these."""
 
 import gzip
@@ -259,6 +259,158 @@ class BlockNotice(unittest.TestCase):
         self.assertIn("back to normal", clear[1])
         self.assertEqual(notify.call_args_list[1].kwargs["priority"], 2)  # quiet
         self.assertNotIn("apple_block_notified", state)
+
+
+class Rejection(unittest.TestCase):
+    """Real pages: offer lists must pass; challenges, CAPTCHAs and errors must not."""
+
+    def test_offer_lists_pass(self):
+        for name in ("amazon_aod_rtx5080_warehouse_B0H86338KX.html.gz", "amazon_aod_warehouse_B0GLPQCR51.html.gz",
+                     "amazon_aod_mac_studio_B0HGS3C159.html.gz"):
+            self.assertIsNone(watch.rejection(200, {}, fixture(name)), name)
+
+    def test_challenges_are_refusals(self):
+        waf = fixture("amazon_waf_challenge_home_202.html.gz")
+        self.assertEqual(watch.rejection(202, {"x-amzn-waf-action": "challenge"}, waf),
+                         "AWS WAF challenge (HTTP 202)")
+        self.assertEqual(watch.rejection(202, {}, waf), "bot challenge page (HTTP 202)")  # even without the header
+        akamai = fixture("amazon_akamai_interstitial_search.html.gz")
+        self.assertEqual(watch.rejection(200, {}, akamai), "bot challenge page (HTTP 200)")
+
+    def test_errors(self):
+        self.assertEqual(watch.rejection(404, {}, fixture("amazon_aod_unknown_asin_404.html.gz")), "HTTP 404")
+        self.assertEqual(watch.rejection(503, {}, ""), "HTTP 503")
+        self.assertEqual(watch.rejection(302, {}, ""), "HTTP 302")  # redirects aren't followed
+        # A 200 that isn't an offer list (here: Amazon's not-found page) is a refusal too.
+        self.assertTrue(watch.rejection(200, {}, fixture("amazon_aod_unknown_asin_404.html.gz"))
+                        .startswith("not an offer list"))
+
+    def test_rtx5080_warehouse_offer(self):
+        title, offers = offers_of("amazon_aod_rtx5080_warehouse_B0H86338KX.html.gz")
+        self.assertIn("RTX 5080", title)
+        wh = [o for o in offers if o.kind == "warehouse"]
+        self.assertEqual([(o.price, o.seller) for o in wh], [(1908.43, "Amazon Retourenkauf")])
+
+
+class ProxyFleetTest(unittest.TestCase):
+    URLS = ["https://www.amazon.de/dp/B0H86338KX", "https://www.amazon.de/dp/B0DS65VMC6"]
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        cfg_path = Path(self.dir.name) / "config.toml"
+        cfg_path.write_text(f"""
+[telegram]
+bot_token = "x"
+chat_id = "1"
+[proxies]
+list_file = "unused"
+per_proxy_interval_minutes = 10
+breaker_halts = 2
+[[product]]
+urls = {json.dumps(self.URLS)}
+max_warehouse = 1400
+proxy = true
+""")
+        self.cfg = watch.load_config(cfg_path)
+        self.clock = [1_000_000.0]
+        self.fleet = watch.ProxyFleet("de-DE")
+        self.fleet.proxies = watch.parse_proxy_list("10.0.0.1:4444:u:pw1\n10.0.0.2:4444:u:pw2\n10.0.0.3:4444:u:pw3\n")
+        self.fleet.loaded_at = self.clock[0]
+        self.state = {}
+        self.used = []  # (ip, asin) per request
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def step(self, response, wait=True):
+        """One proxy_step, by default at the moment the fleet asks for. Returns the notification titles."""
+        if wait:
+            self.clock[0] = max(self.clock[0], self.fleet.next_request)
+
+        def get_offers(p, host, asin):
+            self.used.append((p.ip, asin))
+            return response
+        self.fleet.get_offers = get_offers
+        with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "time", lambda: self.clock[0]):
+            watch.proxy_step(self.fleet, self.cfg, self.state, False)
+        return [c.args[1] for c in notify.call_args_list]
+
+    def ok(self):
+        return mock.Mock(status_code=200, headers={}, text=fixture("amazon_aod_rtx5080_warehouse_B0H86338KX.html.gz"))
+
+    def waf(self):
+        return mock.Mock(status_code=202, headers={"x-amzn-waf-action": "challenge"},
+                         text=fixture("amazon_waf_challenge_home_202.html.gz"))
+
+    def test_config(self):
+        self.assertEqual([p.url for p in self.cfg["proxy_products"]], self.URLS)
+        self.assertEqual(self.cfg["products"], [])
+
+    def test_spreads_over_proxies_and_products(self):
+        for _ in range(3):
+            self.assertEqual(self.step(self.ok()), [])  # 1908.43 is above 1400: no alert
+        self.assertEqual(len({ip for ip, _ in self.used}), 3)  # each proxy once
+        self.assertEqual({a for _, a in self.used}, {"B0H86338KX", "B0DS65VMC6"})
+        # 10 min per proxy over 3 proxies: about one request every 200 s
+        self.assertAlmostEqual(self.fleet.next_request - self.clock[0], 200, delta=41)
+
+    def test_refusal_halts_proxy_and_breaker_pauses_all(self):
+        titles = self.step(self.waf())
+        first = self.used[0][0]
+        self.assertEqual(titles, [f"Amazon refused proxy {first}"])
+        halt = self.state["proxy_halts"][first]
+        self.assertEqual(halt["reason"], "AWS WAF challenge (HTTP 202)")
+        self.assertEqual(halt["until"] - halt["since"], 24 * 3600)
+        self.step(self.ok())
+        self.assertNotEqual(self.used[1][0], first)  # the halted proxy isn't used
+        titles = self.step(self.waf())  # a second refusal within 6 h trips the breaker (breaker_halts = 2)
+        self.assertEqual(titles[-1], "Proxy watch paused")
+        n = len(self.used)
+        self.clock[0] += 3600
+        self.step(self.ok(), wait=False)  # an hour later, still paused: no request
+        self.assertEqual(len(self.used), n)
+        self.assertAlmostEqual(self.fleet.next_request - self.clock[0], 11 * 3600, delta=1)  # 12 h pause
+
+    def test_halted_proxy_comes_back_with_a_quiet_notice(self):
+        self.step(self.waf())
+        first = self.used[0][0]
+        self.state["proxy_halts"][first]["until"] = self.clock[0]  # halt over
+        titles = []
+        for _ in range(6):  # the others first, then its 10 min gap is over
+            titles += self.step(self.ok())
+        self.assertIn(f"Proxy {first} back in use", titles)
+        self.assertTrue(self.state["proxy_halts"][first]["cleared"])
+
+    def test_repeat_refusal_doubles_the_halt(self):
+        self.step(self.waf())
+        first = self.used[0][0]
+        self.state["proxy_halts"][first].update(until=self.clock[0], cleared=True)
+        self.state["proxy_halts"][first]["since"] -= 7 * 3600  # outside the breaker window
+        self.fleet.last_used = {p.ip: self.clock[0] for p in self.fleet.proxies}
+        self.fleet.last_used[first] = 0  # make it the next one picked
+        self.clock[0] += 600
+        self.step(self.waf())
+        self.assertEqual(self.used[-1][0], first)
+        h = self.state["proxy_halts"][first]
+        self.assertEqual((h["count"], h["until"] - h["since"]), (2, 48 * 3600))
+
+    def test_unknown_asin_is_not_a_refusal(self):
+        r = mock.Mock(status_code=404, headers={}, text=fixture("amazon_aod_unknown_asin_404.html.gz"))
+        titles = self.step(r)
+        self.assertEqual(titles, [f"Product not found: {self.used[0][1]}"])
+        self.assertEqual(self.state["proxy_halts"], {})
+
+    def test_proxy_failure_benches_without_alert(self):
+        def boom(p, host, asin):
+            raise ConnectionError(f"proxy {p.user}:{p.password} unreachable")
+        self.fleet.get_offers = boom
+        with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "time", lambda: self.clock[0]), \
+                self.assertLogs("watch", "WARNING") as logs:
+            watch.proxy_step(self.fleet, self.cfg, self.state, False)
+        notify.assert_not_called()
+        self.assertEqual(len(self.fleet.benched), 1)
+        self.assertNotIn("pw", " ".join(logs.output))  # credentials scrubbed
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Price/stock watcher with ntfy and/or Telegram alerts. Notify-only: never buys.
 
-- Amazon: cheapest New and Amazon Warehouse offer vs. your price limits.
+- Amazon: cheapest New and Amazon Warehouse offer vs. your price limits, from the home IP or
+  spread over a proxy pool that halts each proxy at Amazon's first refusal.
 - Apple Certified Refurbished: new listings whose title matches your keywords.
 - Shopify stores (e.g. the MSI store): matching products that come into stock."""
 
@@ -34,6 +35,9 @@ DEFAULT_WAREHOUSE_SELLERS = ["amazon warehouse", "amazon resale", "warehouse dea
 DEFAULT_WAREHOUSE_IDS = ["A8KICS1PHF7ZO"]  # Amazon Warehouse on amazon.de
 # Not "api-services-support@amazon.com": Amazon's ordinary 404 page carries it in a comment.
 CAPTCHA_MARKERS = ("validateCaptcha", "<title>Robot Check</title>")
+# Bot challenges Amazon answers instead of the page: AWS WAF's JavaScript challenge (HTTP 202) and
+# Akamai's interstitial (HTTP 200). Both are in tests/fixtures.
+CHALLENGE_MARKERS = ("awsWafCookieDomainList", "AwsWafIntegration", "bm-verify", "/_sec/verify")
 
 MIN_INTERVAL_MINUTES = 2
 MIN_APPLE_INTERVAL_MINUTES = 2
@@ -42,6 +46,10 @@ BACKOFF_MAX = 6 * 3600
 APPLE_BACKOFF_START = 15 * 60
 APPLE_BACKOFF_MAX = 30 * 60  # Apple's 503s are usually store-wide outages; check back soon
 MIN_SHOP_INTERVAL_MINUTES = 1
+MIN_PROXY_INTERVAL_MINUTES = 3
+PROXY_LIST_REFRESH = 6 * 3600  # Rayobyte replaces IPs now and then
+PROXY_BENCH = 30 * 60  # after a proxy-side failure (unreachable, 407, timeout): not Amazon's doing
+PROXY_HALT_MAX = 7 * 24 * 3600
 SHOP_BACKOFF_START = 15 * 60
 SHOP_BACKOFF_MAX = 2 * 3600
 SHOP_PAGE_SIZE = 250  # Shopify's maximum for products.json
@@ -66,6 +74,24 @@ class Product:
     name: str | None
     max_new: float | None
     max_warehouse: float | None
+    proxy: bool = False
+
+
+@dataclass
+class Proxy:
+    index: int
+    ip: str
+    port: str
+    user: str
+    password: str
+
+    @property
+    def label(self) -> str:  # never the credentials
+        return f"#{self.index} {self.ip}"
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.user}:{self.password}@{self.ip}:{self.port}"
 
 
 @dataclass
@@ -137,13 +163,30 @@ def load_config(path: Path) -> dict:
     if not ntfy.get("topic") and not (tg.get("bot_token") and tg.get("chat_id")):
         raise ValueError("set [ntfy] topic and/or [telegram] bot_token + chat_id")
 
-    products = []
+    products, proxied = [], []
     for i, p in enumerate(cfg.get("product", []), 1):
-        if not p.get("url"):
-            raise ValueError(f"product #{i}: url is required")
+        urls = ([p["url"]] if p.get("url") else []) + list(p.get("urls", []))
+        if not urls:
+            raise ValueError(f"product #{i}: url (or urls) is required")
         if p.get("max_new") is None and p.get("max_warehouse") is None:
             raise ValueError(f"product #{i}: set max_new and/or max_warehouse")
-        products.append(Product(p["url"], p.get("name"), p.get("max_new"), p.get("max_warehouse")))
+        via_proxy = bool(p.get("proxy", False))
+        for url in urls:
+            if via_proxy and not (extract_asin(url) and "amazon." in (urlparse(url).hostname or "")):
+                # A short link would need an extra, non-offer-list request through the proxy.
+                raise ValueError(f"product #{i}: proxied products need a full amazon URL with /dp/<ASIN>: {url}")
+            item = Product(url, p.get("name") if len(urls) == 1 else None,
+                           p.get("max_new"), p.get("max_warehouse"), via_proxy)
+            (proxied if via_proxy else products).append(item)
+    px = cfg.setdefault("proxies", {})
+    px.setdefault("per_proxy_interval_minutes", 10)
+    px.setdefault("halt_hours", 24)
+    px.setdefault("breaker_halts", 3)
+    px.setdefault("breaker_window_hours", 6)
+    px.setdefault("breaker_pause_hours", 12)
+    px["per_proxy_interval_minutes"] = max(px["per_proxy_interval_minutes"], MIN_PROXY_INTERVAL_MINUTES)
+    if proxied and not (px.get("rayobyte_secret") or px.get("list_file")):
+        raise ValueError("proxied products need [proxies] rayobyte_secret or list_file")
     as_list = lambda v: [v] if isinstance(v, str) else list(v or [])
     apple = []
     for i, a in enumerate(cfg.get("apple", []), 1):
@@ -159,9 +202,10 @@ def load_config(path: Path) -> dict:
                                w.get("max_price"),
                                max(interval, MIN_SHOP_INTERVAL_MINUTES) if interval is not None else None,
                                bool(w.get("sold_out_alerts", False))))
-    if not products and not apple and not shops:
+    if not products and not proxied and not apple and not shops:
         raise ValueError("nothing to watch: add [[product]], [[apple]] and/or [[shop]] entries")
-    cfg["products"], cfg["apple_watches"], cfg["shop_watches"] = products, apple, shops
+    cfg["products"], cfg["proxy_products"] = products, proxied
+    cfg["apple_watches"], cfg["shop_watches"] = apple, shops
     return cfg
 
 
@@ -579,14 +623,19 @@ def save_state(path: Path, state: dict):
 
 
 def check_product(amz: Amazon, p: Product, cfg: dict, state: dict, dry_run: bool):
-    s = cfg["settings"]
     resolved = state.setdefault("resolved", {})
     if p.url not in resolved:
         host, asin = amz.resolve(p.url)
         resolved[p.url] = {"host": host, "asin": asin}
     host, asin = resolved[p.url]["host"], resolved[p.url]["asin"]
+    evaluate_offers(p, host, asin, amz.offers(host, asin), cfg, state, dry_run)
 
-    title, offers = parse_offers(amz.offers(host, asin), s["warehouse_sellers"], s["warehouse_seller_ids"])
+
+def evaluate_offers(p: Product, host: str, asin: str, html: str, cfg: dict, state: dict, dry_run: bool,
+                    via: str = ""):
+    """Parse an offer list and alert on New/Warehouse offers within the product's limits."""
+    s = cfg["settings"]
+    title, offers = parse_offers(html, s["warehouse_sellers"], s["warehouse_seller_ids"])
     name = p.name or (title[:60] if title else asin)
     if not offers:
         log.warning("%s: no offers parsed (out of stock, or Amazon changed its markup)", name)
@@ -595,9 +644,9 @@ def check_product(amz: Amazon, p: Product, cfg: dict, state: dict, dry_run: bool
     for o in offers:
         if o.kind != "other" and (o.kind not in best or o.price < best[o.kind].price):
             best[o.kind] = o
-    log.info("%s: new=%s warehouse=%s (%d offers)", name,
+    log.info("%s: new=%s warehouse=%s (%d offers)%s", name,
              best["new"].price if "new" in best else "-",
-             best["warehouse"].price if "warehouse" in best else "-", len(offers))
+             best["warehouse"].price if "warehouse" in best else "-", len(offers), via and f" via {via}")
 
     alerts = state.setdefault("alerts", {})
     now = time.time()
@@ -632,6 +681,209 @@ def amazon_round(amz: Amazon, cfg: dict, state: dict, dry_run: bool) -> bool:
         except Exception:
             log.exception("check failed for %s", p.url)
     return True
+
+
+# --------------------------------------------------------------------------- amazon over proxies
+
+def _yaml_section(text: str, section: str) -> dict:
+    """key: value pairs of one top-level section of a flat YAML file (enough for the secret file)."""
+    out, sec = {}, None
+    for line in text.splitlines():
+        if re.match(r"^\S", line):
+            sec = line.split(":")[0].strip()
+        m = re.match(r'^\s+([\w-]+):\s*["\']?([^"\'\n]*)["\']?\s*$', line)
+        if m and sec == section:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def parse_proxy_list(text: str) -> list[Proxy]:
+    """ip:port:user:pass per line, Rayobyte's export format."""
+    rows = [line.strip().split(":") for line in text.splitlines()]
+    return [Proxy(i, *row) for i, row in enumerate(r for r in rows if len(r) == 4)]
+
+
+def load_proxies(px: dict) -> list[Proxy]:
+    if px.get("list_file"):
+        return parse_proxy_list(Path(px["list_file"]).read_text())
+    ray = _yaml_section(Path(px["rayobyte_secret"]).read_text(), "rayobyte")
+    url = f"https://rayobyte.com/proxy/dashboard/api/export/4/all/{ray['email']}/{ray['api-key']}/list.csv"
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "curl/8"}), timeout=20) as r:
+        return parse_proxy_list(r.read().decode())
+
+
+def rejection(status: int, headers, text: str) -> str | None:
+    """Why an offer-list response is not a normal answer, or None. Anything unexpected counts:
+    halting a proxy on a false alarm costs little, using one Amazon has flagged costs the IP."""
+    waf = headers.get("x-amzn-waf-action")
+    head = text[:20000]
+    if waf:
+        return f"AWS WAF {waf} (HTTP {status})"
+    if any(m in head for m in CAPTCHA_MARKERS):
+        return f"CAPTCHA page (HTTP {status})"
+    if any(m in head for m in CHALLENGE_MARKERS):
+        return f"bot challenge page (HTTP {status})"
+    if status != 200:
+        return f"HTTP {status}"
+    if 'id="aod-container"' not in text:
+        return f"not an offer list ({len(text)} bytes)"
+    return None
+
+
+class ProxyFleet:
+    """Amazon offer lists over a proxy pool, one request at a time, evenly spread: each proxy is used
+    at most every per_proxy_interval_minutes, and the pool as a whole sends one request every
+    interval / active proxies. No homepage warm-up: Amazon answers it with a WAF challenge even for
+    the home IP, while the offer list works without cookies."""
+
+    def __init__(self, accept_language: str):
+        self.accept_language = accept_language
+        self.proxies: list[Proxy] = []
+        self.loaded_at = 0.0
+        self.sessions: dict[str, object] = {}
+        self.last_used: dict[str, float] = {}  # ip -> time
+        self.benched: dict[str, float] = {}  # ip -> until (proxy-side failures, in memory only)
+        self.checked: dict[str, float] = {}  # product url -> time
+        self.next_request = 0.0
+
+    def refresh(self, px: dict):
+        if self.proxies and time.time() - self.loaded_at < PROXY_LIST_REFRESH:
+            return
+        try:
+            fresh = load_proxies(px)
+        except Exception as e:  # the export URL contains the API key: log the type only
+            log.error("proxies: loading the list failed: %s", type(e).__name__)
+            fresh = []
+        if fresh:
+            if {p.ip for p in fresh} != {p.ip for p in self.proxies}:
+                log.info("proxies: %d loaded", len(fresh))
+            self.proxies = fresh
+            self.loaded_at = time.time()
+        elif not self.proxies:
+            self.loaded_at = time.time() - PROXY_LIST_REFRESH + 30 * 60  # retry in 30 min
+
+    def session(self, p: Proxy):
+        key = f"{p.ip}:{p.port}"
+        if key not in self.sessions:
+            s = requests.Session(impersonate="chrome")
+            s.headers.update({"Accept-Language": self.accept_language})
+            s.proxies = {"https": p.url, "http": p.url}
+            self.sessions[key] = s
+        return self.sessions[key]
+
+    def drop_session(self, p: Proxy):
+        self.sessions.pop(f"{p.ip}:{p.port}", None)
+
+    def get_offers(self, p: Proxy, host: str, asin: str):
+        url = (f"https://{host}/gp/product/ajax/aodAjaxMain/ref=dp_aod_ALL_mbc?asin={asin}"
+               "&m=&qid=&smid=&sourcecustomerorglistid=&sourcecustomerorglistitemid=&sr=&pc=dp")
+        return self.session(p).get(url, timeout=30, allow_redirects=False,
+                                   headers={"Referer": f"https://{host}/dp/{asin}"})
+
+
+def _ago(seconds: float) -> str:
+    h, m = divmod(int(seconds // 60), 60)
+    return f"{h} h {m} min" if h else f"{m} min"
+
+
+def _scrub(text: str, p: Proxy) -> str:
+    return text.replace(p.password, "***").replace(p.user, "***")
+
+
+def proxy_step(fleet: ProxyFleet, cfg: dict, state: dict, dry_run: bool):
+    """At most one proxied offer-list request. Sets fleet.next_request.
+    Amazon refusing a proxy halts that IP (halt_hours, doubling on a repeat within a week, max 7 days)
+    and alerts at once; breaker_halts halts within breaker_window_hours pause the whole pool, since
+    then Amazon is likely flagging the pattern rather than single IPs."""
+    px, now = cfg["proxies"], time.time()
+    halts = state.setdefault("proxy_halts", {})  # ip -> {since, until, reason, count, cleared}
+    paused = state.get("proxy_paused_until", 0)
+    if paused > now:
+        fleet.next_request = paused
+        return
+    if paused:
+        state.pop("proxy_paused_until")
+        notify(cfg, "Proxy watch resumed", "The pause is over; checking again, one proxy at a time.",
+               priority=2, tags=["white_check_mark"], dry_run=dry_run)
+
+    fleet.refresh(px)
+    halted = lambda p: halts.get(p.ip, {}).get("until", 0) > now
+    active = [p for p in fleet.proxies if not halted(p)]
+    if not active:
+        waits = [halts[p.ip]["until"] for p in fleet.proxies if halted(p)]
+        fleet.next_request = min(waits) if waits else now + 30 * 60
+        return
+    interval = px["per_proxy_interval_minutes"] * 60
+    gap = interval / len(active) * random.uniform(0.8, 1.2)
+    ready = [p for p in active if fleet.benched.get(p.ip, 0) <= now and now - fleet.last_used.get(p.ip, 0) >= interval]
+    if not ready:
+        fleet.next_request = now + max(gap, 30)
+        return
+    p = min(ready, key=lambda x: (fleet.last_used.get(x.ip, 0), random.random()))
+    prod = min(cfg["proxy_products"], key=lambda x: (fleet.checked.get(x.url, 0), random.random()))
+    host, asin = (urlparse(prod.url).hostname or "").removeprefix("m."), extract_asin(prod.url)
+    fleet.last_used[p.ip] = now
+    fleet.next_request = now + gap
+
+    try:
+        r = fleet.get_offers(p, host, asin)
+    except Exception as e:  # unreachable proxy, 407, timeout: the proxy's problem, not Amazon's
+        log.warning("proxy %s: request failed (%s: %s); benched %d min", p.label, type(e).__name__,
+                    _scrub(str(e), p)[:150], PROXY_BENCH // 60)
+        fleet.benched[p.ip] = now + PROXY_BENCH
+        fleet.drop_session(p)
+        return
+
+    reason = rejection(r.status_code, r.headers, r.text)
+    if reason == "HTTP 404":  # Amazon's plain "page not found": the ASIN is gone, the proxy is fine
+        fleet.checked[prod.url] = now
+        missing = state.setdefault("proxy_missing", [])
+        log.warning("%s: Amazon says the product doesn't exist (HTTP 404 via %s)", asin, p.label)
+        if asin not in missing:
+            missing.append(asin)
+            notify(cfg, f"Product not found: {asin}", "Amazon answers 404 for it. Remove it from the config.",
+                   click=prod.url, priority=2, tags=["question"], dry_run=dry_run)
+        return
+    if reason:
+        prev = halts.get(p.ip, {})
+        count = prev.get("count", 0) + 1 if now - prev.get("since", 0) < PROXY_HALT_MAX else 1
+        hold = min(px["halt_hours"] * 3600 * 2 ** (count - 1), PROXY_HALT_MAX)
+        halts[p.ip] = {"since": now, "until": now + hold, "reason": reason, "count": count, "cleared": False}
+        fleet.drop_session(p)
+        left = len(active) - 1
+        log.warning("proxy %s: Amazon refused %s: %s; halted for %s (%d of %d proxies left)",
+                    p.label, asin, reason, _ago(hold), left, len(fleet.proxies))
+        notify(cfg, f"Amazon refused proxy {p.ip}",
+               f"{reason} on {asin}. Proxy halted for {_ago(hold)}"
+               f"{f' (refused {count}x within a week)' if count > 1 else ''}. "
+               f"{left} of {len(fleet.proxies)} proxies left.",
+               priority=4, tags=["warning"], dry_run=dry_run)
+        recent = [h for h in halts.values() if now - h["since"] < px["breaker_window_hours"] * 3600]
+        if len(recent) >= px["breaker_halts"] or not left:
+            pause = px["breaker_pause_hours"] * 3600
+            state["proxy_paused_until"] = now + pause
+            fleet.next_request = now + pause
+            why = "no proxies left" if not left else \
+                f"{len(recent)} proxies refused within {px['breaker_window_hours']} h"
+            log.warning("proxies: pausing the proxied watch for %s: %s", _ago(pause), why)
+            notify(cfg, "Proxy watch paused",
+                   f"{why}, so Amazon may be flagging the pattern, not single IPs. "
+                   f"Pausing all proxied checks for {_ago(pause)}.",
+                   priority=4, tags=["warning"], dry_run=dry_run)
+        return
+
+    fleet.checked[prod.url] = now
+    if p.ip in halts and not halts[p.ip].get("cleared"):
+        halts[p.ip]["cleared"] = True
+        notify(cfg, f"Proxy {p.ip} back in use",
+               f"Amazon answers it normally again ({_ago(now - halts[p.ip]['since'])} after the refusal).",
+               priority=2, tags=["white_check_mark"], dry_run=dry_run)
+    for ip in [ip for ip, h in halts.items() if h.get("cleared") and now - h["since"] > PROXY_HALT_MAX]:
+        del halts[ip]
+    try:
+        evaluate_offers(prod, host, asin, r.text, cfg, state, dry_run, via=p.label)
+    except Exception:
+        log.exception("check failed for %s", prod.url)
 
 
 last_refusal: dict[str, str] = {}  # source -> why the last refused request failed
@@ -674,6 +926,7 @@ def run(config_path: Path, once: bool, dry_run: bool):
     amz = Amazon(cfg["settings"]["accept_language"])
     apple = new_session(cfg["settings"]["accept_language"])
     shop = new_session(cfg["settings"]["accept_language"])
+    fleet = ProxyFleet(cfg["settings"]["accept_language"])
     amz_backoff = apple_backoff = shop_backoff = 0
     next_amz = next_apple = shop_paused_until = 0.0
     next_shop: dict[str, float] = {}  # per watch URL
@@ -705,6 +958,10 @@ def run(config_path: Path, once: bool, dry_run: bool):
             next_amz = time.time() + (amz_backoff or _jittered(s["interval_minutes"], s["jitter_minutes"]))
             save_state(state_path, state)
 
+        if cfg["proxy_products"] and time.time() >= fleet.next_request:
+            proxy_step(fleet, cfg, state, dry_run)
+            save_state(state_path, state)
+
         due_shops = [w for w in cfg["shop_watches"] if time.time() >= next_shop.get(w.url, 0)]
         if due_shops and time.time() >= shop_paused_until:
             ok = shop_round(shop, cfg, state, dry_run, due_shops)
@@ -723,7 +980,9 @@ def run(config_path: Path, once: bool, dry_run: bool):
             return
         due = [t for t, on in ((next_apple, cfg["apple_watches"]), (next_amz, cfg["products"])) if on]
         due += [max(next_shop.get(w.url, 0), shop_paused_until) for w in cfg["shop_watches"]]
-        pause = max(min(due) - time.time(), 30)
+        if cfg["proxy_products"]:
+            due.append(fleet.next_request)
+        pause = max(min(due) - time.time(), 5)
         log.info("sleeping %.1f min", pause / 60)
         time.sleep(pause)
 

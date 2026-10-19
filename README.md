@@ -2,7 +2,7 @@
 
 A small Python service that sends push notifications through [ntfy](https://ntfy.sh) and/or Telegram for:
 
-- **Amazon products**, with two price limits per product:
+- **Amazon products**, from the home IP or spread over a proxy pool, with two price limits per product:
   - **New**: the cheapest offer in "New" condition, from any seller
   - **Warehouse**: the cheapest offer sold by Amazon Warehouse (also called Amazon Resale / Retourenkauf)
 - **Apple Certified Refurbished**: new listings on a refurbished category page whose title
@@ -93,6 +93,41 @@ max_warehouse = 250
 ```
 
 Leave out `max_new` or `max_warehouse` to ignore that kind of offer.
+
+## Amazon over proxies
+
+For many products, the offer lists can go through a proxy pool instead of the home IP. This is
+built to be careful with the proxies:
+
+```toml
+[proxies]
+rayobyte_secret = "/home/martin/priceapi/skinbaron-secret.yml"   # or list_file = "proxies.txt"
+per_proxy_interval_minutes = 10
+
+[[product]]
+urls = ["https://www.amazon.de/dp/B0DSQ1RCZV", "https://www.amazon.de/dp/B0DS65VMC6"]
+max_warehouse = 1400
+proxy = true
+```
+
+- **Spread out:** one request at a time, each proxy used at most every `per_proxy_interval_minutes`,
+  and the pool sends one request every interval ÷ active proxies (20 proxies at 10 min: one
+  every ~30 s, 144 requests per IP and day). Products are checked oldest-first.
+- **Only the offer list:** one request per check, no homepage visit, no search, redirects not
+  followed. (Since October 2026 Amazon answers the homepage with an AWS WAF JavaScript challenge
+  even from a home IP, and search pages through datacenter proxies with an Akamai challenge; the
+  offer list answers normally.)
+- **Halt at the first refusal:** a CAPTCHA, an AWS WAF or Akamai challenge, any status other than
+  200, or a page that isn't an offer list halts that proxy for `halt_hours` (24, doubling if it's
+  refused again within a week, at most 7 days) and alerts you right away. When it works again
+  you get a quiet "back in use" message. Halts are stored in `state.json` and survive restarts.
+- **Circuit breaker:** `breaker_halts` (3) refusals within `breaker_window_hours` (6) pause all
+  proxied checks for `breaker_pause_hours` (12), because then Amazon is probably flagging the
+  pattern rather than single IPs.
+- **Not Amazon's doing:** a proxy that can't be reached (timeout, 407) sits out 30 minutes
+  without an alert, and a 404 (the product is gone) sends one quiet "product not found".
+- **Credentials** are never logged; proxies show up as `#index ip`. The Rayobyte list is
+  re-read every 6 hours, since Rayobyte replaces IPs now and then.
 
 ## Apple refurbished
 
