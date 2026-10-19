@@ -40,7 +40,7 @@ MIN_APPLE_INTERVAL_MINUTES = 2
 BACKOFF_START = 30 * 60
 BACKOFF_MAX = 6 * 3600
 APPLE_BACKOFF_START = 15 * 60
-APPLE_BACKOFF_MAX = 2 * 3600
+APPLE_BACKOFF_MAX = 30 * 60  # Apple's 503s are usually store-wide outages; check back soon
 MIN_SHOP_INTERVAL_MINUTES = 1
 SHOP_BACKOFF_START = 15 * 60
 SHOP_BACKOFF_MAX = 2 * 3600
@@ -248,8 +248,10 @@ class Amazon:
 
     def get(self, url: str, **kw):
         r = self.session.get(url, timeout=30, allow_redirects=True, **kw)
-        if r.status_code in (429, 503) or any(m in r.text[:20000] for m in CAPTCHA_MARKERS):
-            raise Blocked(f"HTTP {r.status_code} for {url}")
+        if r.status_code in (429, 503):
+            raise Blocked(f"HTTP {r.status_code}", url)
+        if any(m in r.text[:20000] for m in CAPTCHA_MARKERS):
+            raise Blocked("CAPTCHA page", url)
         r.raise_for_status()
         return r
 
@@ -379,7 +381,10 @@ def apple_round(session, cfg: dict, state: dict, dry_run: bool) -> bool:
             log.error("apple: fetching %s failed: %s", url, e)
             continue
         if r.status_code in (403, 429, 503):
-            log.warning("apple: HTTP %d for %s, backing off", r.status_code, url)
+            title = BeautifulSoup(r.text[:20000], "html.parser").title
+            title = _text(title) if title else ""
+            log.warning("apple: HTTP %d for %s (page title: %r), backing off", r.status_code, url, title)
+            last_refusal["apple"] = f"HTTP {r.status_code}" + (f", page title “{title}”" if title else "")
             ok = False
             break
         if r.status_code != 200:
@@ -451,6 +456,7 @@ def fetch_shop(session, url: str) -> list[ShopItem] | None:
         r = session.get(shop_feed_url(url, page), timeout=30, allow_redirects=True)
         if r.status_code in (403, 429, 430, 503):  # 430: Shopify's bot protection
             log.warning("shop: HTTP %d for %s, backing off", r.status_code, url)
+            last_refusal["shop"] = f"HTTP {r.status_code}"
             return None
         r.raise_for_status()
         data = r.json()
@@ -620,11 +626,15 @@ def amazon_round(amz: Amazon, cfg: dict, state: dict, dry_run: bool) -> bool:
         try:
             check_product(amz, p, cfg, state, dry_run)
         except Blocked as e:
-            log.warning("Amazon is blocking us (%s); stopping this round", e)
+            log.warning("Amazon is blocking us (%s for %s); stopping this round", *e.args)
+            last_refusal["amazon"] = e.args[0]
             return False
         except Exception:
             log.exception("check failed for %s", p.url)
     return True
+
+
+last_refusal: dict[str, str] = {}  # source -> why the last refused request failed
 
 
 def _backoff(current: int, start: int, cap: int) -> int:
@@ -636,15 +646,23 @@ def _jittered(minutes: float, jitter: float) -> float:
 
 
 def _block_notice(cfg, state, source: str, blocked: bool, backoff: int, dry_run: bool):
-    """Send one warning per blocked period, and clear it once requests work again."""
+    """Send one warning per blocked period, and a quiet all-clear once requests work again."""
     key = f"{source}_block_notified"
     if blocked and not state.get(key):
+        reason = last_refusal.get(source)
         notify(cfg, f"{source.title()} watcher blocked",
-             f"Requests are being refused. Pausing {backoff // 60} min, backing off further if it persists.",
-             priority=3, tags=["warning"], dry_run=dry_run)
-        state[key] = True
-    elif not blocked:
-        state.pop(key, None)
+               f"Requests are being refused{f' ({reason})' if reason else ''}. "
+               f"Pausing {backoff // 60} min, backing off further if it persists.",
+               priority=3, tags=["warning"], dry_run=dry_run)
+        state[key] = time.time()
+    elif not blocked and state.get(key):
+        since = state.pop(key)
+        took = ""
+        if not isinstance(since, bool):  # older state stored True
+            mins = int((time.time() - since) // 60)
+            took = f" after {mins // 60} h {mins % 60} min" if mins >= 60 else f" after {mins} min"
+        notify(cfg, f"{source.title()} watcher back to normal", f"Requests work again{took}.",
+               priority=2, tags=["white_check_mark"], dry_run=dry_run)
 
 
 def run(config_path: Path, once: bool, dry_run: bool):

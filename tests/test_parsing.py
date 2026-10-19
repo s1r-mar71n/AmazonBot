@@ -241,5 +241,25 @@ class Shopify(unittest.TestCase):
             self.assertFalse(watch.shop_round(session, cfg, {}, False, [w]))
 
 
+class BlockNotice(unittest.TestCase):
+    def test_apple_503_warns_once_then_all_clear(self):
+        refused = mock.Mock(status_code=503, text="")  # body content isn't known; only the status matters
+        session = mock.Mock(get=mock.Mock(return_value=refused))
+        cfg = {"apple_watches": [AppleWatch("https://www.apple.com/de/shop/refurbished/mac/mac-studio",
+                                            ["Mac Studio"], [], None)]}
+        state = {}
+        with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "sleep"):
+            for _ in range(3):  # stays blocked for three rounds: one warning
+                self.assertFalse(watch.apple_round(session, cfg, state, False))
+                watch._block_notice(cfg, state, "apple", True, 900, False)
+            watch._block_notice(cfg, state, "apple", False, 0, False)  # works again
+            watch._block_notice(cfg, state, "apple", False, 0, False)  # still fine: nothing more
+        (warn, _), (clear, _) = [(c.args, c.kwargs) for c in notify.call_args_list]
+        self.assertIn("HTTP 503", warn[2])
+        self.assertIn("back to normal", clear[1])
+        self.assertEqual(notify.call_args_list[1].kwargs["priority"], 2)  # quiet
+        self.assertNotIn("apple_block_notified", state)
+
+
 if __name__ == "__main__":
     unittest.main()
