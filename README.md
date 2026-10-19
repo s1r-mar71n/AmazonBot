@@ -117,7 +117,9 @@ match = ["Mac Studio"]      # every word must appear in the listing title
   than Amazon. Refurbished Mac Studios often sell out within hours.
 - **Blocking is rarely an issue:** Apple's store has no Amazon-style CAPTCHA wall, and 6–12
   requests an hour is negligible traffic. If Apple answers 403/429/503, the watcher backs off
-  (15 min, doubling up to 2 h) and sends you one warning.
+  (15 min, then 30 min) and sends you one warning with the HTTP status. A 503 usually means
+  Apple's store itself is down or overloaded rather than a block, so the watcher keeps
+  checking every 30 minutes and sends a quiet "back to normal" message once the page loads again.
 
 ## Shopify stores (e.g. MSI)
 
@@ -139,7 +141,8 @@ interval_minutes = 1
 - **Sold-out listings:** with `sold_out_alerts = true`, a new listing that is already sold out
   sends a quiet alert (silent in Telegram, low priority in ntfy). Only a store-root entry sees
   these, because collections hide sold-out products.
-- **Blocking:** on HTTP 403/429/430/503 it backs off (15 min, doubling up to 2 h) and sends one warning.
+- **Blocking:** on HTTP 403/429/430/503 it backs off (15 min, doubling up to 2 h), sends one
+  warning, and sends a quiet "back to normal" message once requests work again.
 
 ## Amazon rate limits: read this before adding many products
 
