@@ -7,8 +7,8 @@ A small Python service that sends push notifications through [ntfy](https://ntfy
   - **Warehouse**: the cheapest offer sold by Amazon Warehouse (also called Amazon Resale / Retourenkauf)
 - **Apple Certified Refurbished**: new listings on a refurbished category page whose title
   matches your keywords, with an optional price limit (see [Apple refurbished](#apple-refurbished))
-- **Shopify stores** such as the MSI store: matching products that come into stock
-  (see [Shopify stores](#shopify-stores-eg-msi))
+- **Shopify stores** such as the MSI store, and **Cyberport** listing pages: matching products that
+  come into stock (see [Shopify stores](#shopify-stores-eg-msi) and [Cyberport](#cyberport))
 
 It only notifies you and never buys anything. The old Chrome extension that auto-bought
 items is still in the git history (commit `7922bcd`).
@@ -178,6 +178,30 @@ interval_minutes = 1
   these, because collections hide sold-out products.
 - **Blocking:** on HTTP 403/429/430/503 it backs off (15 min, doubling up to 2 h), sends one
   warning, and sends a quiet "back to normal" message once requests work again.
+
+## Cyberport
+
+A `[[shop]]` entry whose URL is a Cyberport category page (cyberport.at or .de, with any filters
+and sorting from the browser's address bar) is read like a Shopify feed:
+
+```toml
+[[shop]]
+url = "https://www.cyberport.at/markenshops/outlet/gebrauchtware-b-ware-/pc-zubehoer/komponenten/grafikkarten.html?sortBy=PRD-2B1T_de_price_desc&refinementList%5Bfacets.Grafikchiphersteller.values%5D%5B0%5D=NVIDIA"
+match = ["5090"]
+interval_minutes = 2
+sold_out_alerts = true
+```
+
+- **How it reads the page:** one request per check. The page embeds the search results it shows
+  (Cyberport's Algolia data), so nothing is rendered or clicked.
+- **Only the first 20 results:** that's what one page holds, and `page=` in the URL is ignored.
+  Narrow the URL with filters (e.g. add the "Grafikchip: GeForce RTX 5090" filter on the site and
+  copy the URL) so everything you care about fits; the log warns when a page has more.
+- **Rich alerts:** price (the webshop price of the .at or .de shop), condition text of B-stock
+  ("Wie Neu | OVP geöffnet …"), availability, the listing's bullet points, item number,
+  manufacturer part number, EAN and listing date, plus the product photo (Telegram sends it as a
+  photo with the text as caption, ntfy as an attachment) and the direct product link.
+- **Available** means anything but "UNAVAILABLE" (soon-available items can be ordered).
 
 ## Amazon rate limits: read this before adding many products
 

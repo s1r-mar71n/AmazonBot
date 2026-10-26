@@ -4,7 +4,7 @@
 - Amazon: cheapest New and Amazon Warehouse offer vs. your price limits, from the home IP or
   spread over a proxy pool that halts each proxy at Amazon's first refusal.
 - Apple Certified Refurbished: new listings whose title matches your keywords.
-- Shopify stores (e.g. the MSI store): matching products that come into stock."""
+- Shopify stores (e.g. the MSI store) and Cyberport listing pages: matching products that come into stock."""
 
 import argparse
 import json
@@ -121,6 +121,8 @@ class ShopItem:
     price: float | None
     available: bool
     product_type: str
+    details: str = ""  # extra lines for the alert
+    image: str | None = None
 
 
 @dataclass
@@ -491,8 +493,74 @@ def shop_matches(item: ShopItem, w: ShopWatch) -> bool:
             and (w.max_price is None or (item.price is not None and item.price <= w.max_price)))
 
 
+CYBERPORT_AVAILABILITY = {"AVAILABLE": "sofort lieferbar", "UNAVAILABLE": "nicht lieferbar"}
+
+
+def parse_cyberport(html: str, page_url: str) -> list[ShopItem] | None:
+    """The listing of a Cyberport category page: its Next.js data embeds the Algolia results the
+    page renders (up to 20, in the URL's filter and sort order). None if the data isn't there."""
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        return None
+    try:
+        props = json.loads(m.group(1))["props"]["pageProps"]["fullPageProps"]["staticProps"]
+        results = next(iter(props["algoliaServerState"]["initialResults"].values()))["results"][0]
+    except (KeyError, StopIteration, IndexError, json.JSONDecodeError):
+        return None
+    host = urlparse(page_url).hostname or ""
+    shop = "WS_AT" if host.endswith(".at") else "WS_DE"
+    if results.get("nbPages", 1) > 1:
+        log.warning("cyberport: %s has %d pages; only the first is read, narrow the filter", page_url,
+                    results["nbPages"])
+    items = []
+    for h in results.get("hits", []):
+        gross = h.get("salesPricesGross") or {}
+        price = _num(gross.get(shop)) or (min(map(float, gross.values())) if gross else None)
+        status = (h.get("availabilityStatus") or {}).get("ZL_001", "")
+        bullets = [_text(li) for li in BeautifulSoup(h.get("bulletpoints") or "", "html.parser").select("li")]
+        ids = [f"Art.-Nr. {h['objectID']}"]
+        if h.get("manufacturerpartnumber"):
+            ids.append(f"{h.get('manufacturer', '')} {h['manufacturerpartnumber']}".strip())
+        if h.get("gtin"):
+            ids.append(f"EAN {h['gtin']}")
+        lines = []
+        if h.get("bware_error_description"):
+            lines.append(f"Zustand: {h['bware_error_description']}")
+        elif h.get("usedproduct"):
+            lines.append("Zustand: gebraucht / B-Ware")
+        label = CYBERPORT_AVAILABILITY.get(status) or ("bald lieferbar" if status.startswith("SOON_AVAILABLE")
+                                                       else status or "unbekannt")
+        lines.append(f"Verfügbarkeit: {label}")
+        lines += [f"• {b}" for b in bullets]
+        lines.append(" · ".join(ids))
+        if h.get("timestamp_created"):
+            lines.append("Angelegt: " + time.strftime("%d.%m.%Y", time.localtime(h["timestamp_created"])))
+        items.append(ShopItem(
+            key=f"{host}/{h['objectID']}", title=h.get("name", h["objectID"]),
+            url=urljoin(f"https://{host}/", h.get("url", "")), price=price,
+            # SOON_AVAILABLE_* can still be ordered; only UNAVAILABLE counts as sold out.
+            available=bool(status) and status != "UNAVAILABLE",
+            product_type=h.get("categoryid") and str(h["categoryid"]) or "",
+            details="\n".join(lines),
+            image=f"https://img-resizer.cyberport.de/cp/images/600x600/{h['image_url']}" if h.get("image_url") else None))
+    return items
+
+
+def fetch_cyberport(session, url: str) -> list[ShopItem] | None:
+    r = session.get(url, timeout=30, allow_redirects=True)
+    items = parse_cyberport(r.text, url) if r.status_code == 200 else None
+    if items is None:
+        title = BeautifulSoup(r.text[:20000], "html.parser").title
+        log.warning("shop: HTTP %d for %s without listing data (page title: %r), backing off",
+                    r.status_code, url, _text(title) if title else "")
+        last_refusal["shop"] = f"HTTP {r.status_code}" + ("" if r.status_code != 200 else ", no listing data")
+    return items
+
+
 def fetch_shop(session, url: str) -> list[ShopItem] | None:
-    """All pages of a products.json feed. None if the store refused us."""
+    """All pages of a products.json feed (or a Cyberport listing). None if the store refused us."""
+    if "cyberport." in (urlparse(url).hostname or ""):
+        return fetch_cyberport(session, url)
     items = []
     for page in range(1, 21):
         if page > 1:
@@ -508,6 +576,10 @@ def fetch_shop(session, url: str) -> list[ShopItem] | None:
         if len(data.get("products", [])) < SHOP_PAGE_SIZE:
             break
     return items
+
+
+def _shop_message(it: ShopItem, price: str) -> str:
+    return f"{price} · {urlparse(it.url).netloc}" + (f"\n{it.details}" if it.details else "")
 
 
 def shop_round(session, cfg: dict, state: dict, dry_run: bool, watches: list[ShopWatch]) -> bool:
@@ -546,14 +618,14 @@ def shop_round(session, cfg: dict, state: dict, dry_run: bool, watches: list[Sho
             avail.pop(key, None)  # sold out: alert again when it comes back
             if new_listing and sold_out_alerts:
                 price = f"{it.price:.2f} €" if it.price is not None else "price unknown"
-                notify(cfg, f"Listed, sold out: {it.title}", f"{price} · {urlparse(it.url).netloc}",
-                       click=it.url, priority=2, tags=["eyes"], dry_run=dry_run)
+                notify(cfg, f"Listed, sold out: {it.title}", _shop_message(it, price),
+                       click=it.url, priority=2, tags=["eyes"], dry_run=dry_run, photo=it.image)
             continue
         prev = avail.get(key)
         if prev is None or (it.price is not None and prev["price"] is not None and it.price < prev["price"] - 0.005):
             price = f"{it.price:.2f} €" if it.price is not None else "price unknown"
-            notify(cfg, f"In stock: {it.title}", f"{price} · {urlparse(it.url).netloc}", click=it.url,
-                   priority=5, tags=["rotating_light"], dry_run=dry_run)
+            notify(cfg, f"In stock: {it.title}", _shop_message(it, price), click=it.url,
+                   priority=5, tags=["rotating_light"], dry_run=dry_run, photo=it.image)
         avail[key] = {"price": it.price, "seen": now}
     # Collections hide sold-out products, so "not in this feed" doesn't mean sold out. A variant that
     # no feed has shown for a while is gone, though: forget it so a relisting alerts again.
@@ -575,11 +647,24 @@ def _post_json(url: str, body: dict, headers: dict | None = None):
     urllib.request.urlopen(req, timeout=15).close()
 
 
+TELEGRAM_CAPTION_MAX = 1024
+
+
+def telegram_text(title: str, message: str, click: str | None, limit: int) -> str:
+    """title, message, link; the message is cut (never the link) to fit Telegram's limit."""
+    tail = f"\n{click}" if click else ""
+    text = f"{title}\n{message}"
+    if len(text) + len(tail) > limit:
+        text = text[:limit - len(tail) - 1].rstrip() + "…"
+    return text + tail
+
+
 def notify(cfg: dict, title: str, message: str, click: str | None = None,
-           priority: int = 4, tags: list[str] | None = None, dry_run: bool = False):
-    """Send to every configured channel: ntfy and/or Telegram."""
+           priority: int = 4, tags: list[str] | None = None, dry_run: bool = False, photo: str | None = None):
+    """Send to every configured channel: ntfy and/or Telegram. With a photo URL, Telegram gets a
+    photo with the text as caption (falling back to a plain message), ntfy an attachment."""
     if dry_run:
-        log.info("[dry-run] notify: %s | %s", title, message)
+        log.info("[dry-run] notify: %s | %s%s", title, message, f" | photo {photo}" if photo else "")
         return
     n, tg = cfg["ntfy"], cfg["telegram"]
     if n.get("topic"):
@@ -587,6 +672,8 @@ def notify(cfg: dict, title: str, message: str, click: str | None = None,
                 "priority": priority, "tags": tags or []}
         if click:
             body["click"] = click
+        if photo:
+            body["attach"] = photo
         # JSON publishing avoids header-encoding trouble with € and umlauts.
         try:
             _post_json(n["server"].rstrip("/"), body,
@@ -596,13 +683,20 @@ def notify(cfg: dict, title: str, message: str, click: str | None = None,
     if tg.get("bot_token") and tg.get("chat_id"):
         # The link also goes in the text: Telegram asks "Open this link?" before following a
         # button, while a URL in the text opens with one tap (same as immocrawler's alerts).
-        text = f"{title}\n{message}" + (f"\n{click}" if click else "")
-        body = {"chat_id": tg["chat_id"], "text": text,
-                "disable_web_page_preview": True, "disable_notification": priority < 3}
+        api = f"https://api.telegram.org/bot{tg['bot_token']}"
+        base = {"chat_id": tg["chat_id"], "disable_notification": priority < 3}
         if click:
-            body["reply_markup"] = {"inline_keyboard": [[{"text": "Open", "url": click}]]}
+            base["reply_markup"] = {"inline_keyboard": [[{"text": "Open", "url": click}]]}
+        if photo:
+            try:
+                _post_json(f"{api}/sendPhoto", {**base, "photo": photo,
+                                                "caption": telegram_text(title, message, click, TELEGRAM_CAPTION_MAX)})
+                return
+            except Exception as e:  # e.g. Telegram can't fetch the image: send the text alone
+                log.warning("telegram photo failed (%s); sending text only", type(e).__name__)
         try:
-            _post_json(f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage", body)
+            _post_json(f"{api}/sendMessage", {**base, "text": telegram_text(title, message, click, 4096),
+                                              "disable_web_page_preview": True})
         except Exception as e:  # str(e) can contain the URL, i.e. the bot token: log the type only
             log.error("telegram delivery failed: %s", type(e).__name__)
 
