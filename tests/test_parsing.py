@@ -261,6 +261,78 @@ class BlockNotice(unittest.TestCase):
         self.assertNotIn("apple_block_notified", state)
 
 
+class Cyberport(unittest.TestCase):
+    OUTLET = "https://www.cyberport.at/markenshops/outlet/gebrauchtware-b-ware-/pc-zubehoer/komponenten/grafikkarten.html"
+
+    def items(self, name, url=OUTLET):
+        return watch.parse_cyberport(fixture(name), url)
+
+    def test_outlet_listing(self):
+        items = self.items("cyberport_outlet_nvidia_20261026.html.gz")
+        self.assertEqual(len(items), 9)
+        it = items[0]
+        self.assertEqual(it.key, "www.cyberport.at/GWNT-282")
+        self.assertTrue(it.title.startswith("ASUS GeForce RTX 5080 Noctua OC Edition"))
+        self.assertEqual(it.url, "https://www.cyberport.at/pc-und-zubehoer/outlet-a-b-ware-/pdp/gwnt-282/"
+                                 "asus-geforce-rtx-5080-noctua-oc-edition-rtx5080-o16g-noctua-grafikkarte-16-gb.html")
+        self.assertEqual(it.price, 2261.89)  # the Austrian webshop price, not a store or the German one
+        self.assertTrue(it.available)
+        self.assertIn("Zustand: Wie Neu | OVP geöffnet, ohne Gebrauchsspuren.", it.details)
+        self.assertIn("Verfügbarkeit: sofort lieferbar", it.details)
+        self.assertIn("• 16 GB VRAM (GDDR7)", it.details)
+        self.assertIn("Art.-Nr. GWNT-282 · ASUS 90YV0M32-M0NA00 · EAN 4711636205382", it.details)
+        self.assertEqual(it.image, "https://img-resizer.cyberport.de/cp/images/600x600/PI_678834130")
+        self.assertFalse([i for i in items if shop_matches(i, ShopWatch(self.OUTLET, ["5090"], [], [], None, None))])
+
+    def test_german_shop_price(self):
+        it = self.items("cyberport_outlet_nvidia_20261026.html.gz", "https://www.cyberport.de/x.html")[0]
+        self.assertEqual(it.price, 2243.04)
+
+    def test_5090_page(self):
+        items = self.items("cyberport_rtx5090_new_20261026.html.gz")
+        w = ShopWatch(self.OUTLET, ["5090"], [], [], None, None)
+        self.assertEqual(len([i for i in items if shop_matches(i, w)]), 7)
+        self.assertEqual((items[0].title[:40], items[0].price), ("ASUS ROG Astral GeForce RTX 5090 OC ROG-", 7799))
+
+    def test_not_a_listing(self):
+        self.assertIsNone(watch.parse_cyberport(fixture("amazon_aod_unknown_asin_404.html.gz"), self.OUTLET))
+
+    def test_round_alerts_once_with_details_and_photo(self):
+        # The real 5090 page stands in for the outlet: a new 5090 there must alert once, with photo.
+        page = fixture("cyberport_rtx5090_new_20261026.html.gz")
+        session = mock.Mock(get=mock.Mock(return_value=mock.Mock(status_code=200, text=page)))
+        w = ShopWatch(self.OUTLET, ["5090"], [], [], None, 2, True)
+        cfg = {"shop_watches": [w], "settings": {"shop_interval_minutes": 2}}
+        state = {}
+        with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "sleep"):
+            self.assertTrue(watch.shop_round(session, cfg, state, False, [w]))
+            first = list(notify.call_args_list)
+            watch.shop_round(session, cfg, state, False, [w])
+        self.assertEqual(len(first), 7)
+        self.assertEqual(len(notify.call_args_list), 7)  # second round: nothing new
+        title, message = first[0].args[1:3]
+        self.assertTrue(title.startswith("In stock: ASUS ROG Astral GeForce RTX 5090"))
+        self.assertTrue(message.startswith("7799.00 € · www.cyberport.at\nVerfügbarkeit: sofort lieferbar"))
+        self.assertTrue(first[0].kwargs["photo"].startswith("https://img-resizer.cyberport.de/"))
+        self.assertTrue(first[0].kwargs["click"].startswith("https://www.cyberport.at/"))
+
+    def test_refusal(self):
+        session = mock.Mock(get=mock.Mock(return_value=mock.Mock(status_code=403, text="<title>Just a moment...</title>")))
+        w = ShopWatch(self.OUTLET, ["5090"], [], [], None, 2)
+        with mock.patch.object(watch.time, "sleep"):
+            self.assertFalse(watch.shop_round(session, {"shop_watches": [w], "settings": {"shop_interval_minutes": 2}},
+                                              {}, False, [w]))
+
+
+class TelegramText(unittest.TestCase):
+    def test_caption_keeps_the_link(self):
+        link = "https://www.cyberport.at/pdp/x.html"
+        text = watch.telegram_text("Title", "x" * 2000, link, 1024)
+        self.assertEqual(len(text), 1024)
+        self.assertTrue(text.endswith("…\n" + link))
+        self.assertEqual(watch.telegram_text("T", "m", None, 1024), "T\nm")
+
+
 class Rejection(unittest.TestCase):
     """Real pages: offer lists must pass; challenges, CAPTCHAs and errors must not."""
 

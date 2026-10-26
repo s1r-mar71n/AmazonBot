@@ -95,3 +95,13 @@ match = ["5090"]
 types = ["VGA"]
 interval_minutes = 10
 sold_out_alerts = true              # quiet alert when a new 5090 is listed already sold out
+
+# ---------------------------------------------------------------- Cyberport
+# Same [[shop]] entry, with a Cyberport category URL copied from the browser (filters and sort
+# included). One page shows at most 20 products, so filter it down to what you care about.
+
+# [[shop]]
+# url = "https://www.cyberport.at/markenshops/outlet/gebrauchtware-b-ware-/pc-zubehoer/komponenten/grafikkarten.html?sortBy=PRD-2B1T_de_price_desc&refinementList%5Bfacets.Grafikchiphersteller.values%5D%5B0%5D=NVIDIA&refinementList%5Bfacets.Grafikchip.values%5D%5B0%5D=GeForce%20RTX%205090"
+# match = ["5090"]
+# interval_minutes = 2
+# sold_out_alerts = true
