@@ -7,8 +7,9 @@ A small Python service that sends push notifications through [ntfy](https://ntfy
   - **Warehouse**: the cheapest offer sold by Amazon Warehouse (also called Amazon Resale / Retourenkauf)
 - **Apple Certified Refurbished**: new listings on a refurbished category page whose title
   matches your keywords, with an optional price limit (see [Apple refurbished](#apple-refurbished))
-- **Shopify stores** such as the MSI store, and **Cyberport** listing pages: matching products that
-  come into stock (see [Shopify stores](#shopify-stores-eg-msi) and [Cyberport](#cyberport))
+- **Shopify stores** such as the MSI store, and **Cyberport** and **notebooksbilliger.de** listing
+  pages: matching products that come into stock (see [Shopify stores](#shopify-stores-eg-msi),
+  [Cyberport](#cyberport) and [notebooksbilliger.de](#notebooksbilligerde))
 
 It only notifies you and never buys anything. The old Chrome extension that auto-bought
 items is still in the git history (commit `7922bcd`).
@@ -166,6 +167,13 @@ types = ["VGA"]             # Shopify product_type; keeps "RTX 5090 Laptop GPU" 
 interval_minutes = 1
 ```
 
+- **Several models in one entry:** `match_any = ["5090", "5080", "5070 Ti", "9070 XT"]` alerts on
+  a title containing at least one of them (combine with `match` for words that must all appear).
+  Spaces don't count when comparing, so "5070 Ti" also matches "RTX 5070Ti".
+- **A price limit per model:** write `match_any` as a table instead,
+  `match_any = { "5090" = 5000, "5080" = 1400, "5070 Ti" = 1000, "9070 XT" = 750 }`: a listing
+  matches when its title contains one of them and its price is at most that model's limit.
+
 - **How it reads the store:** through Shopify's public `products.json` feed of the collection
   (or of the whole store, if `url` is the store root), so there's no HTML to break.
 - **One alert per variant:** when it's in stock, again if it sells out and comes back, and on a
@@ -177,7 +185,8 @@ interval_minutes = 1
   sends a quiet alert (silent in Telegram, low priority in ntfy). Only a store-root entry sees
   these, because collections hide sold-out products.
 - **Blocking:** on HTTP 403/429/430/503 it backs off (15 min, doubling up to 2 h), sends one
-  warning, and sends a quiet "back to normal" message once requests work again.
+  warning, and sends a quiet "back to normal" message once requests work again. This applies to
+  each store separately: a store that refuses us doesn't pause the others.
 
 ## Cyberport
 
@@ -202,6 +211,29 @@ sold_out_alerts = true
   manufacturer part number, EAN and listing date, plus the product photo (Telegram sends it as a
   photo with the text as caption, ntfy as an attachment) and the direct product link.
 - **Available** means anything but "UNAVAILABLE" (soon-available items can be ordered).
+
+## notebooksbilliger.de
+
+A `[[shop]]` entry whose URL is a notebooksbilliger.de category or outlet page (with filters from
+the browser's address bar):
+
+```toml
+[[shop]]
+url = "https://www.notebooksbilliger.de/vorfuehrware+gebrauchtware/b+ware+ruecklaeufer?box_65666_17978%5B%5D=143"
+match_any = ["5090", "5080", "5070 Ti", "9070 XT"]
+interval_minutes = 2
+sold_out_alerts = true
+```
+
+- **How it reads the page:** one request per check; the product cards are in the HTML.
+- **Bot protection:** the site sits behind Akamai Bot Manager, which answers a Chrome-like client
+  with a fake "404 Die Seite wurde nicht gefunden", even on the home page. The watcher uses a
+  Safari 17 fingerprint for this store, which gets the real page. A 404 or a page without a
+  product listing counts as a refusal (backoff and warning as above).
+- **Only the first 20 results:** that's one page. The log warns when a full page has no "no more
+  products" marker; narrow the URL with filters then.
+- **Alerts:** price, condition ("B-Ware"), availability, the card's spec lines, item number and
+  manufacturer, plus the product photo and link.
 
 ## Amazon rate limits: read this before adding many products
 

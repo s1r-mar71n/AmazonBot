@@ -4,7 +4,8 @@
 - Amazon: cheapest New and Amazon Warehouse offer vs. your price limits, from the home IP or
   spread over a proxy pool that halts each proxy at Amazon's first refusal.
 - Apple Certified Refurbished: new listings whose title matches your keywords.
-- Shopify stores (e.g. the MSI store) and Cyberport listing pages: matching products that come into stock."""
+- Shopify stores (e.g. the MSI store), Cyberport and notebooksbilliger.de listing pages: matching
+  products that come into stock."""
 
 import argparse
 import json
@@ -14,7 +15,7 @@ import re
 import sys
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -53,6 +54,9 @@ PROXY_HALT_MAX = 7 * 24 * 3600
 SHOP_BACKOFF_START = 15 * 60
 SHOP_BACKOFF_MAX = 2 * 3600
 SHOP_PAGE_SIZE = 250  # Shopify's maximum for products.json
+# Akamai Bot Manager on notebooksbilliger.de answers curl_cffi's Chrome fingerprints with a fake 404;
+# Safari 17's passes (tested from the homeserver on 2026-10-29).
+SHOP_IMPERSONATE = {"www.notebooksbilliger.de": "safari17_0"}
 
 
 class Blocked(Exception):
@@ -111,6 +115,8 @@ class ShopWatch:
     max_price: float | None
     interval_minutes: float | None  # None = settings.shop_interval_minutes
     sold_out_alerts: bool = False  # also a quiet alert when a new listing appears already sold out
+    # At least one must appear, at no more than its price limit (None: any price); empty = no constraint.
+    match_any: dict[str, float | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -197,13 +203,15 @@ def load_config(path: Path) -> dict:
         apple.append(AppleWatch(a["url"], as_list(a["match"]), as_list(a.get("exclude")), a.get("max_price")))
     shops = []
     for i, w in enumerate(cfg.get("shop", []), 1):
-        if not w.get("url") or not w.get("match"):
-            raise ValueError(f"shop #{i}: url and match are required")
+        if not w.get("url") or not (w.get("match") or w.get("match_any")):
+            raise ValueError(f"shop #{i}: url and match (or match_any) are required")
         interval = w.get("interval_minutes")
-        shops.append(ShopWatch(w["url"], as_list(w["match"]), as_list(w.get("exclude")), as_list(w.get("types")),
+        any_of = w.get("match_any")  # a list, or a table of keyword -> price limit
+        any_of = dict(any_of) if isinstance(any_of, dict) else dict.fromkeys(as_list(any_of))
+        shops.append(ShopWatch(w["url"], as_list(w.get("match")), as_list(w.get("exclude")), as_list(w.get("types")),
                                w.get("max_price"),
                                max(interval, MIN_SHOP_INTERVAL_MINUTES) if interval is not None else None,
-                               bool(w.get("sold_out_alerts", False))))
+                               bool(w.get("sold_out_alerts", False)), any_of))
     if not products and not proxied and not apple and not shops:
         raise ValueError("nothing to watch: add [[product]], [[apple]] and/or [[shop]] entries")
     cfg["products"], cfg["proxy_products"] = products, proxied
@@ -404,8 +412,8 @@ def apple_matches(item: RefurbItem, w: AppleWatch) -> bool:
             and (w.max_price is None or (item.price is not None and item.price <= w.max_price)))
 
 
-def new_session(accept_language: str):
-    s = requests.Session(impersonate="chrome")
+def new_session(accept_language: str, impersonate: str = "chrome"):
+    s = requests.Session(impersonate=impersonate)
     s.headers.update({"Accept-Language": accept_language})
     return s
 
@@ -485,10 +493,18 @@ def parse_shop(data: dict, page_url: str) -> list[ShopItem]:
     return items
 
 
+def _squash(s: str) -> str:
+    """Shops space model names differently ("RTX 5070 Ti", "RTX 5070Ti"): compare without spaces."""
+    return _norm(s).replace(" ", "")
+
+
 def shop_matches(item: ShopItem, w: ShopWatch) -> bool:
-    t = _norm(item.title)
-    return (all(_norm(k) in t for k in w.match)
-            and not any(_norm(k) in t for k in w.exclude)
+    t = _squash(item.title)
+    return (all(_squash(k) in t for k in w.match)
+            and (not w.match_any or any(_squash(k) in t and (limit is None or (item.price is not None
+                                                                         and item.price <= limit))
+                                        for k, limit in w.match_any.items()))
+            and not any(_squash(k) in t for k in w.exclude)
             and (not w.types or item.product_type.lower() in {x.lower() for x in w.types})
             and (w.max_price is None or (item.price is not None and item.price <= w.max_price)))
 
@@ -553,14 +569,69 @@ def fetch_cyberport(session, url: str) -> list[ShopItem] | None:
         title = BeautifulSoup(r.text[:20000], "html.parser").title
         log.warning("shop: HTTP %d for %s without listing data (page title: %r), backing off",
                     r.status_code, url, _text(title) if title else "")
-        last_refusal["shop"] = f"HTTP {r.status_code}" + ("" if r.status_code != 200 else ", no listing data")
+        last_refusal[urlparse(url).hostname or ""] = (f"HTTP {r.status_code}"
+                                                      + ("" if r.status_code != 200 else ", no listing data"))
+    return items
+
+
+NBB_SOLD_OUT = re.compile(r"nicht (?:lieferbar|verfügbar)|ausverkauft", re.I)
+
+
+def parse_nbb(html: str, page_url: str) -> list[ShopItem] | None:
+    """The product cards of a notebooksbilliger.de category or outlet page (up to 20, in the URL's
+    filter and sort order). None if there is no product listing, e.g. Akamai's fake 404 page."""
+    soup = BeautifulSoup(html, "html.parser")
+    listing = soup.select_one("#product-listing")
+    if listing is None:
+        return None
+    cards = listing.select("div.product-card[data-product-id]")
+    if len(cards) >= 20 and not listing.select_one(".product-listing__no-more-products"):
+        log.warning("notebooksbilliger: %s has more than one page; only the first is read, narrow the filter",
+                    page_url)
+    host = urlparse(page_url).hostname or ""
+    items = []
+    for c in cards:
+        availability = _text(c.select_one(".js-availability-text"))
+        lines = []
+        if condition := _text(c.select_one(".product-card__outlet-state")):
+            lines.append(f"Zustand: {condition}")
+        lines.append(f"Verfügbarkeit: {availability or 'unbekannt'}")
+        lines += [f"• {_text(li)}" for li in c.select(".product-card__list-item")]
+        lines.append(" · ".join(x for x in (f"Art.-Nr. {c.get('data-product-article-number', '')}".strip(),
+                                            c.get("data-product-manufacturer")) if x))
+        img = c.select_one("img.product-card__image")
+        link = c.select_one("a.product-card__link")
+        items.append(ShopItem(
+            key=f"{host}/{c['data-product-id']}", title=_text(c.select_one(".product-card__product-heading-title")),
+            url=urljoin(page_url, link["href"]) if link else page_url, price=parse_price(c.get("data-product-price")),
+            available=bool(availability) and not NBB_SOLD_OUT.search(availability), product_type="",
+            details="\n".join(lines),
+            image=re.sub(r"size=\d+", "size=600", img["src"]) if img and img.get("src") else None))
+    return items
+
+
+def fetch_nbb(session, url: str) -> list[ShopItem] | None:
+    # Akamai's _abck cookie from the first response is never validated (we don't run its sensor
+    # script), and the next request carrying it gets the fake 404: ask without cookies every time.
+    session.cookies.clear()
+    r = session.get(url, timeout=30, allow_redirects=True)
+    items = parse_nbb(r.text, url) if r.status_code == 200 else None
+    if items is None:
+        # Akamai blocks with "404 Die Seite wurde nicht gefunden", even for the home page.
+        log.warning("shop: HTTP %d for %s without a product listing, backing off", r.status_code, url)
+        last_refusal[urlparse(url).hostname or ""] = (f"HTTP {r.status_code}"
+                                                      + ("" if r.status_code != 200 else ", no product listing"))
     return items
 
 
 def fetch_shop(session, url: str) -> list[ShopItem] | None:
-    """All pages of a products.json feed (or a Cyberport listing). None if the store refused us."""
-    if "cyberport." in (urlparse(url).hostname or ""):
+    """All pages of a products.json feed (or a Cyberport / notebooksbilliger listing). None if the store
+    refused us."""
+    host = urlparse(url).hostname or ""
+    if "cyberport." in host:
         return fetch_cyberport(session, url)
+    if "notebooksbilliger." in host:
+        return fetch_nbb(session, url)
     items = []
     for page in range(1, 21):
         if page > 1:
@@ -568,7 +639,7 @@ def fetch_shop(session, url: str) -> list[ShopItem] | None:
         r = session.get(shop_feed_url(url, page), timeout=30, allow_redirects=True)
         if r.status_code in (403, 429, 430, 503):  # 430: Shopify's bot protection
             log.warning("shop: HTTP %d for %s, backing off", r.status_code, url)
-            last_refusal["shop"] = f"HTTP {r.status_code}"
+            last_refusal[host] = f"HTTP {r.status_code}"
             return None
         r.raise_for_status()
         data = r.json()
@@ -582,28 +653,31 @@ def _shop_message(it: ShopItem, price: str) -> str:
     return f"{price} · {urlparse(it.url).netloc}" + (f"\n{it.details}" if it.details else "")
 
 
-def shop_round(session, cfg: dict, state: dict, dry_run: bool, watches: list[ShopWatch]) -> bool:
-    """Check the given [[shop]] watches. Alerts once per variant when it is (or comes back) in stock,
-    and again if its price drops; with sold_out_alerts, quietly when a new listing is already sold out.
-    Returns False if a store refused us."""
+def shop_round(sessions, cfg: dict, state: dict, dry_run: bool, watches: list[ShopWatch]) -> set[str]:
+    """Check the given [[shop]] watches, with sessions[host] for each store. Alerts once per variant
+    when it is (or comes back) in stock, and again if its price drops; with sold_out_alerts, quietly when
+    a new listing is already sold out. Returns the hosts that refused us; their other URLs are skipped."""
     avail = state.setdefault("shop_available", {})  # key -> {"price", "seen"} for in-stock variants
     listed = state.setdefault("shop_listed", {})  # key -> last seen, for every matching variant
     by_url: dict[str, list[ShopWatch]] = {}
     for w in watches:
         by_url.setdefault(w.url, []).append(w)
 
-    now, ok, matched = time.time(), True, {}
+    now, refused, matched = time.time(), set(), {}
     for i, (url, ws) in enumerate(by_url.items()):
+        host = urlparse(url).hostname or ""
+        if host in refused:
+            continue
         if i:
             time.sleep(random.uniform(3, 8))
         try:
-            items = fetch_shop(session, url)
+            items = fetch_shop(sessions[host], url)
         except Exception as e:
             log.error("shop: fetching %s failed: %s", url, e)
             continue
         if items is None:
-            ok = False
-            break
+            refused.add(host)
+            continue
         hits = [(it, any(w.sold_out_alerts for w in ws if shop_matches(it, w)))
                 for it in items if any(shop_matches(it, w) for w in ws)]
         log.info("shop: %s: %d variants, %d matching (%d in stock)", url, len(items), len(hits),
@@ -636,7 +710,19 @@ def shop_round(session, cfg: dict, state: dict, dry_run: bool, watches: list[Sho
     # Longer for listings: a store scan failing for an hour shouldn't repeat a sold-out alert.
     for key in [k for k, seen in listed.items() if now - seen > max(6 * 3600, 3 * longest)]:
         del listed[key]
-    return ok
+    return refused
+
+
+class ShopSessions(dict):
+    """host -> session, made on first use with the browser fingerprint that store lets through."""
+
+    def __init__(self, accept_language: str):
+        super().__init__()
+        self.accept_language = accept_language
+
+    def __missing__(self, host: str):
+        s = self[host] = new_session(self.accept_language, SHOP_IMPERSONATE.get(host, "chrome"))
+        return s
 
 
 # --------------------------------------------------------------------------- notifications
@@ -991,12 +1077,13 @@ def _jittered(minutes: float, jitter: float) -> float:
     return (minutes + random.uniform(-1, 1) * jitter) * 60
 
 
-def _block_notice(cfg, state, source: str, blocked: bool, backoff: int, dry_run: bool):
+def _block_notice(cfg, state, source: str, blocked: bool, backoff: int, dry_run: bool, name: str | None = None):
     """Send one warning per blocked period, and a quiet all-clear once requests work again."""
     key = f"{source}_block_notified"
+    name = name or source.title()
     if blocked and not state.get(key):
         reason = last_refusal.get(source)
-        notify(cfg, f"{source.title()} watcher blocked",
+        notify(cfg, f"{name} watcher blocked",
                f"Requests are being refused{f' ({reason})' if reason else ''}. "
                f"Pausing {backoff // 60} min, backing off further if it persists.",
                priority=3, tags=["warning"], dry_run=dry_run)
@@ -1007,7 +1094,7 @@ def _block_notice(cfg, state, source: str, blocked: bool, backoff: int, dry_run:
         if not isinstance(since, bool):  # older state stored True
             mins = int((time.time() - since) // 60)
             took = f" after {mins // 60} h {mins % 60} min" if mins >= 60 else f" after {mins} min"
-        notify(cfg, f"{source.title()} watcher back to normal", f"Requests work again{took}.",
+        notify(cfg, f"{name} watcher back to normal", f"Requests work again{took}.",
                priority=2, tags=["white_check_mark"], dry_run=dry_run)
 
 
@@ -1017,13 +1104,17 @@ def run(config_path: Path, once: bool, dry_run: bool):
     state = load_state(state_path)
     if "block_notified" in state:  # key name used before Apple support
         state["amazon_block_notified"] = state.pop("block_notified")
+    state.pop("shop_block_notified", None)  # shops back off per store now, keyed by host
     amz = Amazon(cfg["settings"]["accept_language"])
     apple = new_session(cfg["settings"]["accept_language"])
-    shop = new_session(cfg["settings"]["accept_language"])
+    shops = ShopSessions(cfg["settings"]["accept_language"])
     fleet = ProxyFleet(cfg["settings"]["accept_language"])
-    amz_backoff = apple_backoff = shop_backoff = 0
-    next_amz = next_apple = shop_paused_until = 0.0
+    amz_backoff = apple_backoff = 0
+    next_amz = next_apple = 0.0
     next_shop: dict[str, float] = {}  # per watch URL
+    shop_backoff: dict[str, int] = {}  # per host: one store refusing us doesn't pause the others
+    shop_paused_until: dict[str, float] = {}
+    host_of = lambda w: urlparse(w.url).hostname or ""
 
     while True:
         try:
@@ -1056,24 +1147,29 @@ def run(config_path: Path, once: bool, dry_run: bool):
             proxy_step(fleet, cfg, state, dry_run)
             save_state(state_path, state)
 
-        due_shops = [w for w in cfg["shop_watches"] if time.time() >= next_shop.get(w.url, 0)]
-        if due_shops and time.time() >= shop_paused_until:
-            ok = shop_round(shop, cfg, state, dry_run, due_shops)
-            shop_backoff = 0 if ok else _backoff(shop_backoff, SHOP_BACKOFF_START, SHOP_BACKOFF_MAX)
-            _block_notice(cfg, state, "shop", not ok, shop_backoff, dry_run)
-            if ok:
-                for w in due_shops:
+        due_shops = [w for w in cfg["shop_watches"]
+                     if time.time() >= max(next_shop.get(w.url, 0), shop_paused_until.get(host_of(w), 0))]
+        if due_shops:
+            refused = shop_round(shops, cfg, state, dry_run, due_shops)
+            for host in {host_of(w) for w in due_shops}:
+                blocked = host in refused
+                shop_backoff[host] = (_backoff(shop_backoff.get(host, 0), SHOP_BACKOFF_START, SHOP_BACKOFF_MAX)
+                                      if blocked else 0)
+                _block_notice(cfg, state, host, blocked, shop_backoff[host], dry_run,
+                              name=host.removeprefix("www."))
+                if blocked:
+                    shops.pop(host, None)  # fresh session after the pause
+                    shop_paused_until[host] = time.time() + shop_backoff[host]
+            for w in due_shops:
+                if host_of(w) not in refused:
                     minutes = w.interval_minutes or s["shop_interval_minutes"]
                     next_shop[w.url] = time.time() + _jittered(minutes, minutes * 0.2)
-            else:
-                shop = new_session(s["accept_language"])
-                shop_paused_until = time.time() + shop_backoff
             save_state(state_path, state)
 
         if once:
             return
         due = [t for t, on in ((next_apple, cfg["apple_watches"]), (next_amz, cfg["products"])) if on]
-        due += [max(next_shop.get(w.url, 0), shop_paused_until) for w in cfg["shop_watches"]]
+        due += [max(next_shop.get(w.url, 0), shop_paused_until.get(host_of(w), 0)) for w in cfg["shop_watches"]]
         if cfg["proxy_products"]:
             due.append(fleet.next_request)
         pause = max(min(due) - time.time(), 5)

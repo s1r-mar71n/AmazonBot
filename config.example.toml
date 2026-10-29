@@ -101,7 +101,17 @@ sold_out_alerts = true              # quiet alert when a new 5090 is listed alre
 # included). One page shows at most 20 products, so filter it down to what you care about.
 
 # [[shop]]
-# url = "https://www.cyberport.at/markenshops/outlet/gebrauchtware-b-ware-/pc-zubehoer/komponenten/grafikkarten.html?sortBy=PRD-2B1T_de_price_desc&refinementList%5Bfacets.Grafikchiphersteller.values%5D%5B0%5D=NVIDIA&refinementList%5Bfacets.Grafikchip.values%5D%5B0%5D=GeForce%20RTX%205090"
-# match = ["5090"]
+# url = "https://www.cyberport.at/markenshops/outlet/gebrauchtware-b-ware-/pc-zubehoer/komponenten/grafikkarten.html?sortBy=PRD-2B1T_de_price_desc"
+# match_any = ["5090", "5080", "5070 Ti", "9070 XT"]   # any one of these in the title
+# match_any = { "5090" = 5000, "5080" = 1400, "5070 Ti" = 1000, "9070 XT" = 750 }  # ... each with a price limit
+# interval_minutes = 2
+# sold_out_alerts = true
+
+# ---------------------------------------------------------------- notebooksbilliger.de
+# Same [[shop]] entry, with a category or outlet URL from the browser. One page holds 20 products.
+
+# [[shop]]
+# url = "https://www.notebooksbilliger.de/vorfuehrware+gebrauchtware/b+ware+ruecklaeufer?box_65666_17978%5B%5D=143"
+# match_any = ["5090", "5080", "5070 Ti", "9070 XT"]
 # interval_minutes = 2
 # sold_out_alerts = true
