@@ -115,3 +115,4 @@ sold_out_alerts = true              # quiet alert when a new 5090 is listed alre
 # match_any = ["5090", "5080", "5070 Ti", "9070 XT"]
 # interval_minutes = 2
 # sold_out_alerts = true
+# proxy = true                      # Akamai lets one request per IP through: rotate over [proxies]

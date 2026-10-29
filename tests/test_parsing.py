@@ -396,6 +396,40 @@ class NotebooksBilliger(unittest.TestCase):
         self.assertEqual(watch.last_refusal["www.notebooksbilliger.de"], "HTTP 404")
         self.assertEqual(len(notify.call_args_list), 7)  # Cyberport's 5090s still alerted
 
+    def _proxied_round(self, responses, rounds=1):
+        """shop_round over a pool of three proxies; each new session answers with the next response."""
+        pool = [watch.Proxy(i, f"10.0.0.{i}", "8000", "user", "secret") for i in range(3)]
+        made = []
+
+        def new_session(*args):
+            made.append(mock.Mock(get=mock.Mock(return_value=responses[len(made)])))
+            return made[-1]
+
+        w = ShopWatch(self.BWARE, [], [], [], None, 2, match_any=GPUS, proxy=True)
+        cfg = {"shop_watches": [w], "settings": {"shop_interval_minutes": 2}, "proxies": {"list_file": "x"}}
+        sessions = watch.ShopSessions("de-DE")
+        with mock.patch.object(watch, "load_proxies", return_value=pool), \
+                mock.patch.object(watch, "new_session", side_effect=new_session), \
+                mock.patch.object(watch.random, "randrange", return_value=0), \
+                mock.patch.object(watch, "notify"), mock.patch.object(watch.time, "sleep"):
+            refused = [watch.shop_round(sessions, cfg, {}, False, [w]) for _ in range(rounds)]
+        return sessions, made, refused
+
+    def test_proxy_rotation_benches_a_refused_proxy(self):
+        block = mock.Mock(status_code=404, text=fixture("nbb_akamai_block_404_20261029.html.gz"))
+        page = mock.Mock(status_code=200, text=fixture("nbb_bware_gpu_20261029.html.gz"))
+        sessions, made, refused = self._proxied_round([block, page, page, page], rounds=3)
+        self.assertEqual(refused, [set(), set(), set()])  # proxy 0 refused, proxy 1 had the page
+        self.assertEqual([m.proxies["https"] for m in made],  # 0 sits out: 1, then 2, then 1 again
+                         [f"http://user:secret@10.0.0.{i}:8000" for i in (0, 1, 2, 1)])
+        self.assertIn(("www.notebooksbilliger.de", "10.0.0.0"), sessions.benched)
+
+    def test_two_refusing_proxies_block_the_store(self):
+        block = mock.Mock(status_code=404, text=fixture("nbb_akamai_block_404_20261029.html.gz"))
+        _, made, refused = self._proxied_round([block, block])
+        self.assertEqual(refused, [{"www.notebooksbilliger.de"}])
+        self.assertEqual(len(made), 2)  # one retry, not the whole pool
+
     def test_sessions_use_the_store_fingerprint(self):
         with mock.patch.object(watch, "new_session") as new_session:
             sessions = watch.ShopSessions("de-DE")
