@@ -1,9 +1,11 @@
 """Unit tests for the parsing helpers.
 
-The fixtures in tests/fixtures/ are real responses captured from amazon.de and apple.com/de on
-2026-10-14 and 2026-10-19 (gzipped; anonymous-session CSRF and challenge tokens replaced with REDACTED). If a site changes its
+The fixtures in tests/fixtures/ are real responses captured from amazon.de, apple.com/de, the MSI store,
+cyberport.at and notebooksbilliger.de (dates in the file names where present; gzipped; anonymous-session
+CSRF and challenge tokens and CSP nonces replaced with REDACTED). If a site changes its
 markup, capture a fresh page into a new fixture rather than hand-editing these."""
 
+import collections
 import gzip
 import re
 import sys
@@ -26,6 +28,11 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 def fixture(name: str) -> str:
     with gzip.open(FIXTURES / name, "rt", encoding="utf-8") as f:
         return f.read()
+
+
+def every_host(session):
+    """shop_round's sessions mapping, with the one session for every store."""
+    return collections.defaultdict(lambda: session)
 
 
 def offers_of(name: str, wh_names=DEFAULT_WAREHOUSE_SELLERS, wh_ids=DEFAULT_WAREHOUSE_IDS):
@@ -175,7 +182,7 @@ class Shopify(unittest.TestCase):
         session = mock.Mock()
         session.get.return_value = FakeResponse(data)
         with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "sleep"):
-            ok = watch.shop_round(session, cfg, state, False, watches)
+            ok = not watch.shop_round(every_host(session), cfg, state, False, watches)
         self.last_priorities = [c.kwargs.get("priority") for c in notify.call_args_list]
         return ok, [c.args[1] for c in notify.call_args_list]
 
@@ -238,7 +245,7 @@ class Shopify(unittest.TestCase):
         cfg = {"shop_watches": [], "settings": {"shop_interval_minutes": 1}}
         w = ShopWatch(MSI, ["5090"], [], ["VGA"], None, None)
         with mock.patch.object(watch, "notify"), mock.patch.object(watch.time, "sleep"):
-            self.assertFalse(watch.shop_round(session, cfg, {}, False, [w]))
+            self.assertEqual(watch.shop_round(every_host(session), cfg, {}, False, [w]), {"de-store.msi.com"})
 
 
 class BlockNotice(unittest.TestCase):
@@ -305,9 +312,9 @@ class Cyberport(unittest.TestCase):
         cfg = {"shop_watches": [w], "settings": {"shop_interval_minutes": 2}}
         state = {}
         with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "sleep"):
-            self.assertTrue(watch.shop_round(session, cfg, state, False, [w]))
+            self.assertEqual(watch.shop_round(every_host(session), cfg, state, False, [w]), set())
             first = list(notify.call_args_list)
-            watch.shop_round(session, cfg, state, False, [w])
+            watch.shop_round(every_host(session), cfg, state, False, [w])
         self.assertEqual(len(first), 7)
         self.assertEqual(len(notify.call_args_list), 7)  # second round: nothing new
         title, message = first[0].args[1:3]
@@ -320,8 +327,83 @@ class Cyberport(unittest.TestCase):
         session = mock.Mock(get=mock.Mock(return_value=mock.Mock(status_code=403, text="<title>Just a moment...</title>")))
         w = ShopWatch(self.OUTLET, ["5090"], [], [], None, 2)
         with mock.patch.object(watch.time, "sleep"):
-            self.assertFalse(watch.shop_round(session, {"shop_watches": [w], "settings": {"shop_interval_minutes": 2}},
-                                              {}, False, [w]))
+            self.assertEqual(watch.shop_round(every_host(session), {"shop_watches": [w],
+                                                                   "settings": {"shop_interval_minutes": 2}},
+                                              {}, False, [w]), {"www.cyberport.at"})
+
+
+GPUS = dict.fromkeys(["5090", "5080", "5070 Ti", "9070 XT"])
+
+
+class NotebooksBilliger(unittest.TestCase):
+    BWARE = "https://www.notebooksbilliger.de/vorfuehrware+gebrauchtware/b+ware+ruecklaeufer?box_65666_17978%5B%5D=143"
+    NVIDIA = "https://www.notebooksbilliger.de/pc+hardware/grafikkarten/nvidia"
+
+    def test_bware_listing(self):
+        items = watch.parse_nbb(fixture("nbb_bware_gpu_20261029.html.gz"), self.BWARE)
+        self.assertEqual(len(items), 2)
+        it = items[0]
+        self.assertEqual(it.key, "www.notebooksbilliger.de/919350")
+        self.assertEqual(it.title, "Acer Predator BiFrost AMD Radeon RX 7800 XT OC White B-Ware")
+        self.assertEqual(it.url, "https://www.notebooksbilliger.de/acer+predator+bifrost+amd+radeon+rx+7800+xt+oc+white"
+                                 "+b+ware+919350")
+        self.assertEqual(it.price, 1152.99)
+        self.assertTrue(it.available)
+        self.assertTrue(it.details.startswith("Zustand: B-Ware\nVerfügbarkeit: Sofort ab Lager / Express\n"))
+        self.assertIn("• Speicher; 16 GB GDDR6", it.details)
+        self.assertTrue(it.details.endswith("Art.-Nr. A1117072 · Acer"))
+        self.assertEqual(it.image, "https://media2.nbb-cdn.de/images/products/Predator-Radeon-RX-7800-white_1-custom"
+                                   ".jpeg_b832.jpg?size=600")
+        self.assertFalse([i for i in items if shop_matches(i, ShopWatch(self.BWARE, [], [], [], None, None,
+                                                                         match_any=GPUS))])
+
+    def test_match_any_on_full_page(self):
+        with self.assertLogs("watch", "WARNING") as logs:  # 20 cards and no end marker: there's a page 2
+            items = watch.parse_nbb(fixture("nbb_nvidia_gpu_20261029.html.gz"), self.NVIDIA)
+        self.assertIn("more than one page", logs.output[0])
+        self.assertEqual(len(items), 20)
+        hits = [i.title for i in items if shop_matches(i, ShopWatch(self.NVIDIA, [], [], [], None, None,
+                                                                    match_any=GPUS))]
+        self.assertEqual(len(hits), 7)  # two 5080s, five 5070 Ti; not the 5070 or 5060 Ti
+        self.assertTrue(all("5080" in t or "5070 Ti" in t for t in hits))
+
+    def test_price_limit_per_model(self):
+        items = watch.parse_nbb(fixture("nbb_nvidia_gpu_20261029.html.gz"), self.NVIDIA)
+        limits = {"5090": 5000, "5080": 2250, "5070 Ti": 1500, "9070 XT": 750}
+        w = ShopWatch(self.NVIDIA, [], [], [], None, None, match_any=limits)
+        # 5080s at 2258.99 and 2249.00; 5070 Ti at 1544.63 (twice), 1399.00, 1549.00, 1557.99.
+        self.assertEqual(sorted(i.price for i in items if shop_matches(i, w)), [1399.0, 2249.0])
+
+    def test_spacing_doesnt_matter(self):
+        w = ShopWatch(self.BWARE, [], [], [], None, None, match_any=GPUS)
+        nbb_style = watch.ShopItem("k", "Gainward GeForce RTX 5070Ti Phoenix B-Ware", "u", 900, True, "")
+        self.assertTrue(shop_matches(nbb_style, w))
+        self.assertFalse(shop_matches(watch.ShopItem("k", "Sapphire Pulse Radeon RX 9070", "u", 600, True, ""), w))
+
+    def test_akamai_block_pauses_only_that_store(self):
+        block = mock.Mock(status_code=404, text=fixture("nbb_akamai_block_404_20261029.html.gz"))
+        self.assertIsNone(watch.parse_nbb(block.text, self.BWARE))
+        cyberport = mock.Mock(status_code=200, text=fixture("cyberport_rtx5090_new_20261026.html.gz"))
+        sessions = {"www.notebooksbilliger.de": mock.Mock(get=mock.Mock(return_value=block)),
+                    "www.cyberport.at": mock.Mock(get=mock.Mock(return_value=cyberport))}
+        watches = [ShopWatch(self.BWARE, [], [], [], None, 2, match_any=GPUS),
+                   ShopWatch(Cyberport.OUTLET, [], [], [], None, 1, match_any=GPUS)]
+        cfg = {"shop_watches": watches, "settings": {"shop_interval_minutes": 2}}
+        with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "sleep"):
+            refused = watch.shop_round(sessions, cfg, {}, False, watches)
+        self.assertEqual(refused, {"www.notebooksbilliger.de"})
+        sessions["www.notebooksbilliger.de"].cookies.clear.assert_called_once()  # Akamai's cookie never sent back
+        self.assertEqual(watch.last_refusal["www.notebooksbilliger.de"], "HTTP 404")
+        self.assertEqual(len(notify.call_args_list), 7)  # Cyberport's 5090s still alerted
+
+    def test_sessions_use_the_store_fingerprint(self):
+        with mock.patch.object(watch, "new_session") as new_session:
+            sessions = watch.ShopSessions("de-DE")
+            sessions["www.notebooksbilliger.de"]
+            sessions["www.cyberport.at"]
+            sessions["www.cyberport.at"]
+        self.assertEqual([c.args for c in new_session.call_args_list],
+                         [("de-DE", "safari17_0"), ("de-DE", "chrome")])
 
 
 class TelegramText(unittest.TestCase):
