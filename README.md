@@ -230,6 +230,12 @@ sold_out_alerts = true
   with a fake "404 Die Seite wurde nicht gefunden", even on the home page. The watcher uses a
   Safari 17 fingerprint for this store, which gets the real page. A 404 or a page without a
   product listing counts as a refusal (backoff and warning as above).
+- **One request per IP:** Akamai lets an IP's first request through and refuses the next ones for
+  10+ minutes (longer while it keeps asking), so polling every few minutes from one IP gets
+  blocked. Add `proxy = true` to the entry to send each request over the next proxy of the
+  [`[proxies]`](#amazon-over-proxies) pool: with 20 proxies and `interval_minutes = 2`, each
+  IP sees one request every 40 minutes. A proxy the store refuses sits out that store for an hour
+  and the next one is tried at once; only when that one is refused too does the store back off.
 - **Only the first 20 results:** that's one page. The log warns when a full page has no "no more
   products" marker; narrow the URL with filters then.
 - **Alerts:** price, condition ("B-Ware"), availability, the card's spec lines, item number and

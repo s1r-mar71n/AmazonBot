@@ -57,6 +57,9 @@ SHOP_PAGE_SIZE = 250  # Shopify's maximum for products.json
 # Akamai Bot Manager on notebooksbilliger.de answers curl_cffi's Chrome fingerprints with a fake 404;
 # Safari 17's passes (tested from the homeserver on 2026-10-29).
 SHOP_IMPERSONATE = {"www.notebooksbilliger.de": "safari17_0"}
+# A proxy a store refused sits out that store this long. Akamai on notebooksbilliger.de lets one
+# request per IP through, then refuses that IP for 10+ minutes, longer while it keeps asking.
+SHOP_PROXY_BENCH = 60 * 60
 
 
 class Blocked(Exception):
@@ -117,6 +120,7 @@ class ShopWatch:
     sold_out_alerts: bool = False  # also a quiet alert when a new listing appears already sold out
     # At least one must appear, at no more than its price limit (None: any price); empty = no constraint.
     match_any: dict[str, float | None] = field(default_factory=dict)
+    proxy: bool = False  # each request over the next proxy of the [proxies] pool
 
 
 @dataclass
@@ -193,8 +197,6 @@ def load_config(path: Path) -> dict:
     px.setdefault("breaker_window_hours", 6)
     px.setdefault("breaker_pause_hours", 12)
     px["per_proxy_interval_minutes"] = max(px["per_proxy_interval_minutes"], MIN_PROXY_INTERVAL_MINUTES)
-    if proxied and not (px.get("rayobyte_secret") or px.get("list_file")):
-        raise ValueError("proxied products need [proxies] rayobyte_secret or list_file")
     as_list = lambda v: [v] if isinstance(v, str) else list(v or [])
     apple = []
     for i, a in enumerate(cfg.get("apple", []), 1):
@@ -211,7 +213,9 @@ def load_config(path: Path) -> dict:
         shops.append(ShopWatch(w["url"], as_list(w.get("match")), as_list(w.get("exclude")), as_list(w.get("types")),
                                w.get("max_price"),
                                max(interval, MIN_SHOP_INTERVAL_MINUTES) if interval is not None else None,
-                               bool(w.get("sold_out_alerts", False)), any_of))
+                               bool(w.get("sold_out_alerts", False)), any_of, bool(w.get("proxy", False))))
+    if (proxied or any(w.proxy for w in shops)) and not (px.get("rayobyte_secret") or px.get("list_file")):
+        raise ValueError("proxied products and shops need [proxies] rayobyte_secret or list_file")
     if not products and not proxied and not apple and not shops:
         raise ValueError("nothing to watch: add [[product]], [[apple]] and/or [[shop]] entries")
     cfg["products"], cfg["proxy_products"] = products, proxied
@@ -618,7 +622,7 @@ def fetch_nbb(session, url: str) -> list[ShopItem] | None:
     items = parse_nbb(r.text, url) if r.status_code == 200 else None
     if items is None:
         # Akamai blocks with "404 Die Seite wurde nicht gefunden", even for the home page.
-        log.warning("shop: HTTP %d for %s without a product listing, backing off", r.status_code, url)
+        log.warning("shop: HTTP %d for %s without a product listing (refused)", r.status_code, url)
         last_refusal[urlparse(url).hostname or ""] = (f"HTTP {r.status_code}"
                                                       + ("" if r.status_code != 200 else ", no product listing"))
     return items
@@ -654,7 +658,8 @@ def _shop_message(it: ShopItem, price: str) -> str:
 
 
 def shop_round(sessions, cfg: dict, state: dict, dry_run: bool, watches: list[ShopWatch]) -> set[str]:
-    """Check the given [[shop]] watches, with sessions[host] for each store. Alerts once per variant
+    """Check the given [[shop]] watches, with sessions[host] for each store (a ShopSessions proxy for
+    proxy = true watches; a refused proxy sits out and the next one gets a go). Alerts once per variant
     when it is (or comes back) in stock, and again if its price drops; with sold_out_alerts, quietly when
     a new listing is already sold out. Returns the hosts that refused us; their other URLs are skipped."""
     avail = state.setdefault("shop_available", {})  # key -> {"price", "seen"} for in-stock variants
@@ -670,18 +675,31 @@ def shop_round(sessions, cfg: dict, state: dict, dry_run: bool, watches: list[Sh
             continue
         if i:
             time.sleep(random.uniform(3, 8))
+        via = None
         try:
-            items = fetch_shop(sessions[host], url)
-        except Exception as e:
-            log.error("shop: fetching %s failed: %s", url, e)
+            if any(w.proxy for w in ws):
+                items = None
+                for _ in range(2):
+                    if not (via := sessions.proxy_for(host, cfg.get("proxies", {}))):
+                        log.warning("shop: no proxy available for %s", host)
+                        break
+                    items = fetch_shop(via[0], url)
+                    if items is not None:
+                        break
+                    sessions.bench(host, via[1])
+            else:
+                items = fetch_shop(sessions[host], url)
+        except Exception as e:  # a proxy URL holds credentials: name the proxy, not the error text
+            log.error("shop: fetching %s failed: %s", url,
+                      f"{type(e).__name__} via proxy {via[1].label}" if via else e)
             continue
         if items is None:
             refused.add(host)
             continue
         hits = [(it, any(w.sold_out_alerts for w in ws if shop_matches(it, w)))
                 for it in items if any(shop_matches(it, w) for w in ws)]
-        log.info("shop: %s: %d variants, %d matching (%d in stock)", url, len(items), len(hits),
-                 sum(it.available for it, _ in hits))
+        log.info("shop: %s%s: %d variants, %d matching (%d in stock)", url, f" via {via[1].label}" if via else "",
+                 len(items), len(hits), sum(it.available for it, _ in hits))
         for it, quiet in hits:
             matched[it.key] = (it, quiet or matched.get(it.key, (None, False))[1])
 
@@ -714,15 +732,45 @@ def shop_round(sessions, cfg: dict, state: dict, dry_run: bool, watches: list[Sh
 
 
 class ShopSessions(dict):
-    """host -> session, made on first use with the browser fingerprint that store lets through."""
+    """host -> session, made on first use with the browser fingerprint that store lets through.
+    proxy_for() hands out a fresh session over the next proxy of the pool instead."""
 
     def __init__(self, accept_language: str):
         super().__init__()
         self.accept_language = accept_language
+        self.proxies: list[Proxy] = []
+        self.loaded_at = 0.0
+        self.turn: dict[str, int] = {}  # host -> rotation position
+        self.benched: dict[tuple[str, str], float] = {}  # (host, proxy ip) -> until
 
     def __missing__(self, host: str):
         s = self[host] = new_session(self.accept_language, SHOP_IMPERSONATE.get(host, "chrome"))
         return s
+
+    def proxy_for(self, host: str, px: dict):
+        """(session, proxy) for the next proxy this store hasn't refused lately, or None."""
+        if not self.proxies or time.time() - self.loaded_at > PROXY_LIST_REFRESH:
+            try:
+                self.proxies = load_proxies(px) or self.proxies
+            except Exception as e:  # the export URL contains the API key: log the type only
+                log.error("proxies: loading the list failed: %s", type(e).__name__)
+            self.loaded_at = time.time()
+        if not self.proxies:
+            return None
+        # A random start, so a restart doesn't always hit the same few IPs first.
+        turn, now = self.turn.get(host, random.randrange(len(self.proxies))), time.time()
+        for k in range(len(self.proxies)):  # round the pool in order, skipping benched proxies
+            p = self.proxies[(turn + k) % len(self.proxies)]
+            if self.benched.get((host, p.ip), 0) <= now:
+                self.turn[host] = turn + k + 1
+                s = new_session(self.accept_language, SHOP_IMPERSONATE.get(host, "chrome"))
+                s.proxies = {"https": p.url, "http": p.url}
+                return s, p
+        return None
+
+    def bench(self, host: str, p: Proxy):
+        log.info("shop: %s refused proxy %s; it sits out %d min", host, p.label, SHOP_PROXY_BENCH // 60)
+        self.benched[(host, p.ip)] = time.time() + SHOP_PROXY_BENCH
 
 
 # --------------------------------------------------------------------------- notifications
