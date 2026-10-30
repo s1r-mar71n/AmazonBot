@@ -113,6 +113,6 @@ sold_out_alerts = true              # quiet alert when a new 5090 is listed alre
 # [[shop]]
 # url = "https://www.notebooksbilliger.de/vorfuehrware+gebrauchtware/b+ware+ruecklaeufer?box_65666_17978%5B%5D=143"
 # match_any = ["5090", "5080", "5070 Ti", "9070 XT"]
-# interval_minutes = 2
+# interval_minutes = 20             # Akamai lets ~3 requests an hour through; faster gets refused
 # sold_out_alerts = true
-# proxy = true                      # Akamai lets one request per IP through: rotate over [proxies]
+# proxy = true                      # rotate over the [proxies] pool
