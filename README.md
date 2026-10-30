@@ -186,7 +186,8 @@ interval_minutes = 1
   these, because collections hide sold-out products.
 - **Blocking:** on HTTP 403/429/430/503 it backs off (15 min, doubling up to 2 h), sends one
   warning, and sends a quiet "back to normal" message once requests work again. This applies to
-  each store separately: a store that refuses us doesn't pause the others.
+  each store separately: a store that refuses us doesn't pause the others. The warning waits
+  until a store has refused for an hour, so short refusals only show in the log.
 
 ## Cyberport
 
@@ -221,7 +222,7 @@ the browser's address bar):
 [[shop]]
 url = "https://www.notebooksbilliger.de/vorfuehrware+gebrauchtware/b+ware+ruecklaeufer?box_65666_17978%5B%5D=143"
 match_any = ["5090", "5080", "5070 Ti", "9070 XT"]
-interval_minutes = 2
+interval_minutes = 20
 sold_out_alerts = true
 ```
 
@@ -230,12 +231,13 @@ sold_out_alerts = true
   with a fake "404 Die Seite wurde nicht gefunden", even on the home page. The watcher uses a
   Safari 17 fingerprint for this store, which gets the real page. A 404 or a page without a
   product listing counts as a refusal (backoff and warning as above).
-- **One request per IP:** Akamai lets an IP's first request through and refuses the next ones for
-  10+ minutes (longer while it keeps asking), so polling every few minutes from one IP gets
-  blocked. Add `proxy = true` to the entry to send each request over the next proxy of the
-  [`[proxies]`](#amazon-over-proxies) pool: with 20 proxies and `interval_minutes = 2`, each
-  IP sees one request every 40 minutes. A proxy the store refuses sits out that store for an hour
-  and the next one is tried at once; only when that one is refused too does the store back off.
+- **About 3 requests an hour:** after an hour of quiet, Akamai lets 2–4 requests a few minutes
+  apart through, then refuses every further one for about an hour, whatever the IP (seen over
+  20 proxies on 2026-10-29/30). So check every 20 minutes (`interval_minutes = 20`); faster
+  polling only gets more refusals.
+- **Proxies:** `proxy = true` sends each request over the next proxy of the
+  [`[proxies]`](#amazon-over-proxies) pool. A proxy the store refuses sits out that store for an
+  hour and the next one is tried at once; only when that one is refused too does the store back off.
 - **Only the first 20 results:** that's one page. The log warns when a full page has no "no more
   products" marker; narrow the URL with filters then.
 - **Alerts:** price, condition ("B-Ware"), availability, the card's spec lines, item number and

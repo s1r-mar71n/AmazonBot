@@ -60,6 +60,9 @@ SHOP_IMPERSONATE = {"www.notebooksbilliger.de": "safari17_0"}
 # A proxy a store refused sits out that store this long. Akamai on notebooksbilliger.de lets one
 # request per IP through, then refuses that IP for 10+ minutes, longer while it keeps asking.
 SHOP_PROXY_BENCH = 60 * 60
+# Stores refuse now and then for a few minutes (notebooksbilliger.de's Akamai lets ~3 requests an
+# hour through, whatever the IP): warn only about a block that lasts this long.
+SHOP_BLOCK_GRACE = 60 * 60
 
 
 class Blocked(Exception):
@@ -1125,18 +1128,26 @@ def _jittered(minutes: float, jitter: float) -> float:
     return (minutes + random.uniform(-1, 1) * jitter) * 60
 
 
-def _block_notice(cfg, state, source: str, blocked: bool, backoff: int, dry_run: bool, name: str | None = None):
-    """Send one warning per blocked period, and a quiet all-clear once requests work again."""
-    key = f"{source}_block_notified"
+def _block_notice(cfg, state, source: str, blocked: bool, backoff: int, dry_run: bool, name: str | None = None,
+                  grace: int = 0):
+    """Send one warning per blocked period (once it has lasted `grace` seconds), and a quiet all-clear
+    once requests work again."""
+    key, since_key = f"{source}_block_notified", f"{source}_blocked_since"
     name = name or source.title()
-    if blocked and not state.get(key):
+    if blocked:
+        since = state.setdefault(since_key, time.time())
+        if state.get(key) or time.time() - since < grace:
+            return
         reason = last_refusal.get(source)
+        started = f" since {time.strftime('%H:%M', time.localtime(since))}" if grace else ""
         notify(cfg, f"{name} watcher blocked",
-               f"Requests are being refused{f' ({reason})' if reason else ''}. "
+               f"Requests are being refused{started}{f' ({reason})' if reason else ''}. "
                f"Pausing {backoff // 60} min, backing off further if it persists.",
                priority=3, tags=["warning"], dry_run=dry_run)
-        state[key] = time.time()
-    elif not blocked and state.get(key):
+        state[key] = since
+        return
+    state.pop(since_key, None)
+    if state.get(key):
         since = state.pop(key)
         took = ""
         if not isinstance(since, bool):  # older state stored True
@@ -1204,7 +1215,7 @@ def run(config_path: Path, once: bool, dry_run: bool):
                 shop_backoff[host] = (_backoff(shop_backoff.get(host, 0), SHOP_BACKOFF_START, SHOP_BACKOFF_MAX)
                                       if blocked else 0)
                 _block_notice(cfg, state, host, blocked, shop_backoff[host], dry_run,
-                              name=host.removeprefix("www."))
+                              name=host.removeprefix("www."), grace=SHOP_BLOCK_GRACE)
                 if blocked:
                     shops.pop(host, None)  # fresh session after the pause
                     shop_paused_until[host] = time.time() + shop_backoff[host]

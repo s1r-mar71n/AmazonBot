@@ -249,6 +249,27 @@ class Shopify(unittest.TestCase):
 
 
 class BlockNotice(unittest.TestCase):
+    def _notices(self, events, grace=3600):
+        """_block_notice for (minutes, blocked) events; the titles it sent."""
+        state = {}
+        with mock.patch.object(watch, "notify") as notify:
+            for minutes, blocked in events:
+                with mock.patch.object(watch.time, "time", return_value=1e9 + minutes * 60):
+                    watch._block_notice({}, state, "www.notebooksbilliger.de", blocked, 900, False,
+                                        name="notebooksbilliger.de", grace=grace)
+        return [c.args[1] for c in notify.call_args_list], state
+
+    def test_short_shop_blocks_stay_quiet(self):
+        # NBB's pattern: refused for 45 min, then works again. No warning, no all-clear.
+        titles, state = self._notices([(0, True), (15, True), (45, True), (105, False)])
+        self.assertEqual(titles, [])
+        self.assertEqual(state, {})
+
+    def test_long_shop_block_warns_once_then_clears(self):
+        titles, state = self._notices([(0, True), (45, True), (105, True), (225, True), (345, False)])
+        self.assertEqual(titles, ["notebooksbilliger.de watcher blocked", "notebooksbilliger.de watcher back to normal"])
+        self.assertEqual(state, {})
+
     def test_apple_503_warns_once_then_all_clear(self):
         refused = mock.Mock(status_code=503, text="")  # body content isn't known; only the status matters
         session = mock.Mock(get=mock.Mock(return_value=refused))
