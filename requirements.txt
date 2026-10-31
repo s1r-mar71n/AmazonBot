@@ -1,3 +1,4 @@
 curl_cffi>=0.7
 beautifulsoup4>=4.12
 tomli>=2.0; python_version < "3.11"
+patchright>=1.50  # only for [[shop]] entries with browser = true (drives the installed Google Chrome)

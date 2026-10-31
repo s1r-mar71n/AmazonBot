@@ -17,6 +17,7 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -60,6 +61,7 @@ SHOP_IMPERSONATE = {"www.notebooksbilliger.de": "safari17_0"}
 # A proxy a store refused sits out that store this long. Akamai on notebooksbilliger.de lets one
 # request per IP through, then refuses that IP for 10+ minutes, longer while it keeps asking.
 SHOP_PROXY_BENCH = 60 * 60
+BROWSER_SETTLE_MS = 3000  # after the page loads, let the bot protection's script run before reading it
 # Stores refuse now and then for a few minutes (notebooksbilliger.de's Akamai lets ~3 requests an
 # hour through, whatever the IP): warn only about a block that lasts this long.
 SHOP_BLOCK_GRACE = 60 * 60
@@ -124,6 +126,7 @@ class ShopWatch:
     # At least one must appear, at no more than its price limit (None: any price); empty = no constraint.
     match_any: dict[str, float | None] = field(default_factory=dict)
     proxy: bool = False  # each request over the next proxy of the [proxies] pool
+    browser: bool = False  # load the page in real Google Chrome (BrowserSession)
 
 
 @dataclass
@@ -216,7 +219,10 @@ def load_config(path: Path) -> dict:
         shops.append(ShopWatch(w["url"], as_list(w.get("match")), as_list(w.get("exclude")), as_list(w.get("types")),
                                w.get("max_price"),
                                max(interval, MIN_SHOP_INTERVAL_MINUTES) if interval is not None else None,
-                               bool(w.get("sold_out_alerts", False)), any_of, bool(w.get("proxy", False))))
+                               bool(w.get("sold_out_alerts", False)), any_of, bool(w.get("proxy", False)),
+                               bool(w.get("browser", False))))
+        if shops[-1].proxy and shops[-1].browser:
+            raise ValueError(f"shop #{i}: proxy and browser can't be combined")
     if (proxied or any(w.proxy for w in shops)) and not (px.get("rayobyte_secret") or px.get("list_file")):
         raise ValueError("proxied products and shops need [proxies] rayobyte_secret or list_file")
     if not products and not proxied and not apple and not shops:
@@ -618,9 +624,6 @@ def parse_nbb(html: str, page_url: str) -> list[ShopItem] | None:
 
 
 def fetch_nbb(session, url: str) -> list[ShopItem] | None:
-    # Akamai's _abck cookie from the first response is never validated (we don't run its sensor
-    # script), and the next request carrying it gets the fake 404: ask without cookies every time.
-    session.cookies.clear()
     r = session.get(url, timeout=30, allow_redirects=True)
     items = parse_nbb(r.text, url) if r.status_code == 200 else None
     if items is None:
@@ -680,7 +683,9 @@ def shop_round(sessions, cfg: dict, state: dict, dry_run: bool, watches: list[Sh
             time.sleep(random.uniform(3, 8))
         via = None
         try:
-            if any(w.proxy for w in ws):
+            if any(w.browser for w in ws):
+                items = fetch_shop(sessions.browser, url)
+            elif any(w.proxy for w in ws):
                 items = None
                 for _ in range(2):
                     if not (via := sessions.proxy_for(host, cfg.get("proxies", {}))):
@@ -734,13 +739,41 @@ def shop_round(sessions, cfg: dict, state: dict, dry_run: bool, watches: list[Sh
     return refused
 
 
+class BrowserSession:
+    """A requests-like get() through real Google Chrome, driven by patchright (a Playwright fork without
+    the automation traces bot managers look for). For stores that refuse anything not running their
+    scripts: Akamai on notebooksbilliger.de refuses curl_cffi's TLS fingerprints after a few requests
+    whatever the IP, and plain Playwright-driven Chrome every time, but lets this through (tested from
+    the home IP on 2026-10-31). Chrome needs a display (run.sh starts the watcher under xvfb-run); it
+    starts for each request and closes again, and the profile keeps its cookies in between."""
+
+    def __init__(self, profile: Path):
+        self.profile = profile
+
+    def get(self, url: str, timeout: float = 30, allow_redirects: bool = True):
+        from patchright.sync_api import sync_playwright  # only needed for browser = true stores
+
+        with sync_playwright() as pw:
+            ctx = pw.chromium.launch_persistent_context(str(self.profile), channel="chrome", headless=False,
+                                                        no_viewport=True)
+            try:
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                r = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                page.wait_for_timeout(BROWSER_SETTLE_MS)
+                return SimpleNamespace(status_code=r.status if r else 0, text=page.content())
+            finally:
+                ctx.close()
+
+
 class ShopSessions(dict):
     """host -> session, made on first use with the browser fingerprint that store lets through.
-    proxy_for() hands out a fresh session over the next proxy of the pool instead."""
+    proxy_for() hands out a fresh session over the next proxy of the pool instead, and `browser` loads
+    pages in real Chrome."""
 
-    def __init__(self, accept_language: str):
+    def __init__(self, accept_language: str, browser_profile: Path = Path("chrome-profile")):
         super().__init__()
         self.accept_language = accept_language
+        self.browser = BrowserSession(browser_profile)
         self.proxies: list[Proxy] = []
         self.loaded_at = 0.0
         self.turn: dict[str, int] = {}  # host -> rotation position
@@ -1166,7 +1199,7 @@ def run(config_path: Path, once: bool, dry_run: bool):
     state.pop("shop_block_notified", None)  # shops back off per store now, keyed by host
     amz = Amazon(cfg["settings"]["accept_language"])
     apple = new_session(cfg["settings"]["accept_language"])
-    shops = ShopSessions(cfg["settings"]["accept_language"])
+    shops = ShopSessions(cfg["settings"]["accept_language"], config_path.parent.resolve() / "chrome-profile")
     fleet = ProxyFleet(cfg["settings"]["accept_language"])
     amz_backoff = apple_backoff = 0
     next_amz = next_apple = 0.0

@@ -413,7 +413,6 @@ class NotebooksBilliger(unittest.TestCase):
         with mock.patch.object(watch, "notify") as notify, mock.patch.object(watch.time, "sleep"):
             refused = watch.shop_round(sessions, cfg, {}, False, watches)
         self.assertEqual(refused, {"www.notebooksbilliger.de"})
-        sessions["www.notebooksbilliger.de"].cookies.clear.assert_called_once()  # Akamai's cookie never sent back
         self.assertEqual(watch.last_refusal["www.notebooksbilliger.de"], "HTTP 404")
         self.assertEqual(len(notify.call_args_list), 7)  # Cyberport's 5090s still alerted
 
@@ -450,6 +449,27 @@ class NotebooksBilliger(unittest.TestCase):
         _, made, refused = self._proxied_round([block, block])
         self.assertEqual(refused, [{"www.notebooksbilliger.de"}])
         self.assertEqual(len(made), 2)  # one retry, not the whole pool
+
+    def test_browser_session(self):
+        # patchright stand-in: Chrome "loads" the real B-Ware page; the round parses it like any fetch.
+        page = mock.Mock(content=mock.Mock(return_value=fixture("nbb_bware_gpu_20261029.html.gz")))
+        page.goto.return_value = mock.Mock(status=200)
+        ctx = mock.Mock(pages=[page])
+        pw = mock.MagicMock()
+        pw.__enter__.return_value.chromium.launch_persistent_context.return_value = ctx
+        fake = mock.Mock(sync_api=mock.Mock(sync_playwright=mock.Mock(return_value=pw)))
+        w = ShopWatch(self.BWARE, [], [], [], None, 2, match_any=GPUS, browser=True)
+        cfg = {"shop_watches": [w], "settings": {"shop_interval_minutes": 2}}
+        sessions = watch.ShopSessions("de-DE", Path("/tmp/profile"))
+        with mock.patch.dict(sys.modules, {"patchright": fake, "patchright.sync_api": fake.sync_api}), \
+                mock.patch.object(watch, "new_session") as new_session, mock.patch.object(watch.time, "sleep"):
+            self.assertEqual(watch.shop_round(sessions, cfg, {}, False, [w]), set())
+        new_session.assert_not_called()  # no curl_cffi request at all
+        launch = pw.__enter__.return_value.chromium.launch_persistent_context
+        self.assertEqual(launch.call_args.args, ("/tmp/profile",))
+        self.assertEqual(launch.call_args.kwargs["channel"], "chrome")
+        page.goto.assert_called_once_with(self.BWARE, wait_until="domcontentloaded", timeout=30000)
+        ctx.close.assert_called_once()
 
     def test_sessions_use_the_store_fingerprint(self):
         with mock.patch.object(watch, "new_session") as new_session:

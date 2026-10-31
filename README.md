@@ -78,8 +78,9 @@ Instead of the systemd unit, you can let cron keep the watcher alive, as on the 
 */2 * * * * flock -n /home/martin/price-watch/run.lock /home/martin/price-watch/deploy/run.sh
 ```
 
-`deploy/run.sh` starts `watch.py` with the venv's Python, logs to `watch.log` (rotated at 20 MB),
-and restarts it within 2 minutes after a crash or reboot. Python 3.10 works too (`tomli` is
+`deploy/run.sh` starts `watch.py` with the venv's Python (under `xvfb-run` if installed, for
+`browser = true` stores), logs to `watch.log` (rotated at 20 MB), and restarts it within 2 minutes
+after a crash or reboot. Python 3.10 works too (`tomli` is
 installed automatically).
 
 ## Configuration
@@ -222,22 +223,26 @@ the browser's address bar):
 [[shop]]
 url = "https://www.notebooksbilliger.de/vorfuehrware+gebrauchtware/b+ware+ruecklaeufer?box_65666_17978%5B%5D=143"
 match_any = ["5090", "5080", "5070 Ti", "9070 XT"]
-interval_minutes = 20
+interval_minutes = 2
 sold_out_alerts = true
+browser = true                      # needed: see below
 ```
 
-- **How it reads the page:** one request per check; the product cards are in the HTML.
-- **Bot protection:** the site sits behind Akamai Bot Manager, which answers a Chrome-like client
-  with a fake "404 Die Seite wurde nicht gefunden", even on the home page. The watcher uses a
-  Safari 17 fingerprint for this store, which gets the real page. A 404 or a page without a
-  product listing counts as a refusal (backoff and warning as above).
-- **About 3 requests an hour:** after an hour of quiet, Akamai lets 2–4 requests a few minutes
-  apart through, then refuses every further one for about an hour, whatever the IP (seen over
-  20 proxies on 2026-10-29/30). So check every 20 minutes (`interval_minutes = 20`); faster
-  polling only gets more refusals.
-- **Proxies:** `proxy = true` sends each request over the next proxy of the
-  [`[proxies]`](#amazon-over-proxies) pool. A proxy the store refuses sits out that store for an
-  hour and the next one is tried at once; only when that one is refused too does the store back off.
+- **Bot protection:** the site sits behind Akamai Bot Manager, which answers clients it takes for
+  bots with a fake "404 Die Seite wurde nicht gefunden", even on the home page. A plain HTTP
+  client (curl_cffi with a Safari fingerprint) gets about 3 pages an hour through, whatever the IP
+  or proxy; Chrome driven by plain Playwright gets none.
+- **`browser = true`:** loads the page in the installed Google Chrome, driven by
+  [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) (a Playwright fork
+  without the automation traces bot managers look for), which Akamai lets through like a normal
+  visitor. Chrome starts for each check (about 5 s) and closes again; its profile, with the
+  cookies, is kept in `chrome-profile/` next to the config. Needs `pip install patchright`
+  (in `requirements.txt`), Google Chrome, and a display: `deploy/run.sh` starts the watcher under
+  `xvfb-run` when it's installed (`apt install xvfb`). A 404 or a page without a product listing
+  still counts as a refusal (backoff and warning as above).
+- **`proxy = true`** (not together with `browser`) sends each plain request over the next proxy of
+  the [`[proxies]`](#amazon-over-proxies) pool. A proxy the store refuses sits out that store for
+  an hour and the next one is tried at once; only when that one is refused too does the store back off.
 - **Only the first 20 results:** that's one page. The log warns when a full page has no "no more
   products" marker; narrow the URL with filters then.
 - **Alerts:** price, condition ("B-Ware"), availability, the card's spec lines, item number and
